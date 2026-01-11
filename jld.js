@@ -1,8 +1,5 @@
 /**
- * ==========================================================
- *  JustLetterDeploy (JLD) - Secure URL -> Code Fetcher
- *  File: /home/container/cmds/justletterdeploy|jld.js
- * ==========================================================
+ * JustLetterDeploy (JLD) - Secure URL -> Code Fetcher (TEXT ONLY)
  *
  * Commands:
  *  - jld <url>              -> request code from URL (asks password)
@@ -10,14 +7,12 @@
  *  - jldcancel              -> cancel session
  *
  * Notes:
+ *  - TEXT ONLY: never sends as file/document
  *  - DOES NOT execute code. Only fetches and returns.
- *  - Returns as message if small, else sends as .js document.
- * ==========================================================
  */
 
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
 const https = require("https");
 const http = require("http");
 
@@ -28,10 +23,10 @@ const DATA_DIR = path.join("/home/container", "cmds", ".jld");
 const PASS_FILE = path.join(DATA_DIR, "pass.json");
 
 const TTL = 2 * 60 * 1000; // 2 minutes
-const MAX_BYTES = 350 * 1024; // 350KB max fetch (safety)
-const MAX_MSG_CHARS = 3500; // WhatsApp friendly
+const MAX_BYTES = 450 * 1024; // 450KB fetch limit
+const CHUNK = 3200; // message chunk size (safe)
 
-/* ----------------- HELPERS ----------------- */
+/* ----------------- FILE DB ----------------- */
 function ensureDirs() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(PASS_FILE)) fs.writeFileSync(PASS_FILE, JSON.stringify({ pass: "" }, null, 2));
@@ -50,6 +45,7 @@ function writePass(p) {
   fs.writeFileSync(PASS_FILE, JSON.stringify({ pass: String(p || "").trim() }, null, 2));
 }
 
+/* ----------------- CORE SAFE ----------------- */
 function getCfgAny() {
   try {
     if (typeof config === "function") return config() || {};
@@ -73,9 +69,6 @@ function getSenderId(m) {
 }
 function getChatId(m) {
   return m?.key?.remoteJid || m?.chat || "unknown";
-}
-function skey(m) {
-  return `${getChatId(m)}::${getSenderId(m)}`;
 }
 
 function isAllowed(m) {
@@ -109,24 +102,15 @@ function isValidHttpUrl(u) {
   }
 }
 
-function guessFileNameFromUrl(u) {
-  try {
-    const x = new URL(u);
-    const base = path.basename(x.pathname || "") || "plugin.js";
-    if (!base.endsWith(".js")) return base + ".js";
-    return base;
-  } catch {
-    return "plugin.js";
-  }
-}
-
-function fetchText(url, redirectsLeft = 5) {
+/* ----------------- FETCH (redirect safe) ----------------- */
+function fetchText(url, redirectsLeft = 6) {
   return new Promise((resolve, reject) => {
     if (!isValidHttpUrl(url)) return reject(new Error("Invalid URL"));
 
     const lib = url.startsWith("https") ? https : http;
+
     const req = lib.get(url, (res) => {
-      // handle redirects
+      // redirects
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectsLeft > 0) {
         const next = new URL(res.headers.location, url).toString();
         res.resume();
@@ -145,56 +129,41 @@ function fetchText(url, redirectsLeft = 5) {
         size += d.length;
         if (size > MAX_BYTES) {
           req.destroy();
-          return reject(new Error(`File too large (>${MAX_BYTES / 1024}KB)`));
+          return reject(new Error(`File too large (>${Math.floor(MAX_BYTES / 1024)}KB)`));
         }
         chunks.push(d);
       });
 
-      res.on("end", () => {
-        const buf = Buffer.concat(chunks);
-        // decode as utf8 text
-        resolve(buf.toString("utf8"));
-      });
+      res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     });
 
     req.on("error", reject);
   });
 }
 
-async function sendAsDoc(m, text, filename = "plugin.js") {
-  const buf = Buffer.from(String(text || ""), "utf8");
+/* ----------------- TEXT SEND (NO FILES) ----------------- */
+async function sendCodeAsText(m, code) {
+  const txt = String(code || "");
+  if (!txt.trim()) return m.reply ? m.reply("❌ Empty response") : null;
 
-  // Kord wrappers differ; try best options:
-  try {
-    if (m?.client?.sendMessage) {
-      return await m.client.sendMessage(
-        getChatId(m),
-        { document: buf, mimetype: "text/plain", fileName: filename },
-        { quoted: m }
-      );
-    }
-  } catch {}
+  // nice header first
+  if (m.reply) await m.reply(`✅ Code fetched (${txt.length} chars). Sending as text...`);
 
-  // fallback: message chunks
-  return sendAsChunks(m, text);
-}
-
-async function sendAsChunks(m, text) {
-  const s = String(text || "");
-  if (!s) return m.reply ? m.reply("❌ Empty response") : null;
-
-  // chunk into safe size
-  for (let i = 0; i < s.length; i += MAX_MSG_CHARS) {
-    const part = s.slice(i, i + MAX_MSG_CHARS);
+  // split safely
+  for (let i = 0; i < txt.length; i += CHUNK) {
+    const part = txt.slice(i, i + CHUNK);
     const block = "```js\n" + part + "\n```";
     if (m.reply) await m.reply(block);
   }
   return null;
 }
 
-/* ----------------- SESSION STATE ----------------- */
+/* ----------------- SESSION ----------------- */
 const SESS = new Map();
 
+function skey(m) {
+  return `${getChatId(m)}::${getSenderId(m)}`;
+}
 function setSession(m, data) {
   SESS.set(skey(m), { ...data, ts: Date.now() });
 }
@@ -215,9 +184,9 @@ function clearSession(m) {
 
 /* ----------------- COMMANDS ----------------- */
 
-// Set password
+// set password
 kord(
-  { cmd: "jldpass", desc: "Set JustLetterDeploy password", fromMe: wtype, type: "tools", react: "🔐" },
+  { cmd: "jldpass", desc: "Set JLD password", fromMe: wtype, type: "tools", react: "🔐" },
   async (m, text) => {
     if (!isAllowed(m)) return;
 
@@ -233,9 +202,9 @@ kord(
   }
 );
 
-// Start fetch (asks password)
+// start fetch
 kord(
-  { cmd: "jld|justletterdeploy", desc: "Fetch plugin code from URL (password required)", fromMe: wtype, type: "tools", react: "📦" },
+  { cmd: "jld|justletterdeploy", desc: "Fetch code from URL (password required)", fromMe: wtype, type: "tools", react: "📦" },
   async (m, text) => {
     if (!isAllowed(m)) return;
 
@@ -258,13 +227,13 @@ kord(
     setSession(m, { mode: "await_pass", url });
     return m.reply
       ? m.reply(
-          `🔐 JLD Locked\n\nSend your password now to decode & return the code.\n(Reply within ${Math.floor(TTL / 1000)}s)\n\nCancel: ${pfx}jldcancel`
+          `🔐 JLD Locked\n\nSend your password now.\n(Reply within ${Math.floor(TTL / 1000)}s)\n\nCancel: ${pfx}jldcancel`
         )
       : null;
   }
 );
 
-// Cancel
+// cancel
 kord(
   { cmd: "jldcancel", desc: "Cancel JLD session", fromMe: wtype, type: "tools", react: "❌" },
   async (m) => {
@@ -293,7 +262,6 @@ kord({ on: "all" }, async (m, textArg) => {
     const passTry = String(raw || "").trim();
     if (!passTry) return;
 
-    // do not keep session alive forever
     const saved = readPass();
     if (!saved) {
       clearSession(m);
@@ -301,29 +269,17 @@ kord({ on: "all" }, async (m, textArg) => {
     }
 
     if (passTry !== saved) {
-      // keep session but warn
       return m.reply ? m.reply("❌ Wrong password. Try again or use jldcancel.") : null;
     }
 
-    // correct password
+    // correct
     const url = s.url;
     clearSession(m);
 
-    await (m.reply ? m.reply("✅ Password verified. Fetching code...") : null);
+    if (m.reply) await m.reply("✅ Password verified. Fetching code...");
 
     const code = await fetchText(url);
-
-    const filename = guessFileNameFromUrl(url);
-
-    // If small enough, send in message. Else send as document.
-    if (code.length <= 9000) {
-      // safe block
-      const out = "```js\n" + code + "\n```";
-      return m.reply ? m.reply(out) : null;
-    }
-
-    // large: send as document
-    return await sendAsDoc(m, code, filename);
+    return await sendCodeAsText(m, code);
   } catch (e) {
     try {
       clearSession(m);
