@@ -1,37 +1,30 @@
 /**
- * ==========================================================
- *  LINKSHIELD PRO v1 — Clean Clickable Link Cards (No extra npm)
- *  File: /home/container/cmds/linkshield|lshield.js
- * ==========================================================
+ * Premium LinkCard (clickable)
+ * cmd: linkcard | lcard | card | link
+ * Usage:
+ *   .linkcard https://example.com
+ *   .lcard example.com
  *
- * Commands:
- *   - linkshield <url>        -> Generates a clickable card that opens the URL
- *   - lshield <url>           -> alias
- *   - linkshield help         -> help screen
- *
- * How it works:
- *   - Fetches basic metadata (title) from the site (best-effort)
- *   - Generates a thumbnail using thum.io (best-effort)
- *   - Sends a WhatsApp "externalAdReply" card with sourceUrl = your link
- *
- * No extra packages needed.
+ * Optional setvar:
+ *   LINKCARD_THUMB = direct image url (overrides thum.io)
+ *   LINKCARD_TITLE = custom title override
  */
 
 const https = require("https");
 const http = require("http");
 const { kord, wtype, prefix, config } = require("../core");
 
-/* ------------------------- Utils ------------------------- */
-
 function getCfgAny() {
-  try {
-    if (typeof config === "function") return config() || {};
-  } catch {}
-  try {
-    return config || {};
-  } catch {
-    return {};
-  }
+  try { return typeof config === "function" ? (config() || {}) : (config || {}); } catch { return {}; }
+}
+
+function getVar(name, fallback = "") {
+  const env = process.env?.[name];
+  if (env !== undefined && env !== null && String(env).trim()) return String(env).trim();
+  const cfg = getCfgAny();
+  const v = cfg?.[name];
+  if (v !== undefined && v !== null && String(v).trim()) return String(v).trim();
+  return fallback;
 }
 
 function SAFE_PREFIX() {
@@ -41,185 +34,146 @@ function SAFE_PREFIX() {
   return ".";
 }
 
-function getChatId(m) {
-  return m?.key?.remoteJid || m?.chat || "unknown";
+function normalizeUrl(input) {
+  let s = String(input || "").trim();
+  if (!s) return "";
+  if (!/^https?:\/\//i.test(s)) s = "https://" + s;
+  return s;
 }
 
-function isValidHttpUrl(u) {
-  try {
-    const x = new URL(u);
-    return x.protocol === "http:" || x.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
-function extractFirstUrl(text) {
-  if (!text) return "";
-  const s = String(text);
-  const m = s.match(/https?:\/\/[^\s<>"'`]+/i);
-  return m ? m[0] : "";
-}
-
-function domainOf(url) {
-  try {
-    return new URL(url).hostname.replace(/^www\./i, "");
-  } catch {
-    return "website";
-  }
-}
-
-function cleanTitle(t, fallback) {
-  const x = String(t || "").replace(/\s+/g, " ").trim();
-  if (!x) return fallback;
-  // Avoid mega titles
-  return x.length > 64 ? x.slice(0, 61) + "..." : x;
-}
-
-function fetchBuffer(url, maxBytes = 800_000) {
-  return new Promise((resolve, reject) => {
+function fetchText(url, ms = 7000) {
+  return new Promise((resolve) => {
     try {
-      const lib = url.startsWith("https:") ? https : http;
+      const lib = url.startsWith("https") ? https : http;
       const req = lib.get(url, (res) => {
-        // follow redirects
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          res.resume();
-          const next = res.headers.location.startsWith("http")
-            ? res.headers.location
-            : new URL(res.headers.location, url).toString();
-          return resolve(fetchBuffer(next, maxBytes));
+          return resolve(fetchText(res.headers.location, ms));
         }
-
-        if (res.statusCode !== 200) {
-          res.resume();
-          return reject(new Error("HTTP " + res.statusCode));
-        }
-
-        const chunks = [];
-        let size = 0;
-
-        res.on("data", (d) => {
-          size += d.length;
-          if (size > maxBytes) {
-            req.destroy();
-            return reject(new Error("Too large"));
-          }
-          chunks.push(d);
-        });
-        res.on("end", () => resolve(Buffer.concat(chunks)));
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve(data));
       });
-
-      req.on("error", reject);
-    } catch (e) {
-      reject(e);
+      req.on("error", () => resolve(""));
+      req.setTimeout(ms, () => {
+        try { req.destroy(); } catch {}
+        resolve("");
+      });
+    } catch {
+      resolve("");
     }
   });
 }
 
-async function fetchTitleFromPage(url) {
-  // best-effort: read small html and regex <title>
-  try {
-    const htmlBuf = await fetchBuffer(url, 500_000);
-    const html = htmlBuf.toString("utf8");
-    const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-    if (!m) return "";
-    return m[1].replace(/<[^>]+>/g, "").trim();
-  } catch {
-    return "";
-  }
+function extractTitle(html) {
+  if (!html) return "";
+  const m = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (!m) return "";
+  return String(m[1]).replace(/\s+/g, " ").trim().slice(0, 60);
 }
 
-function thumIoThumb(url) {
-  // Public thumbnail. Works for many sites, not guaranteed.
-  // You can swap providers later if you want.
-  const encoded = encodeURIComponent(url);
-  return `https://image.thum.io/get/width/800/${encoded}`;
-}
-
-/* --------------------- Sender (Card) --------------------- */
-
-async function sendLinkCard(m, url) {
-  const host = domainOf(url);
-  const fallbackTitle = host.toUpperCase();
-
-  const title = cleanTitle(await fetchTitleFromPage(url), fallbackTitle);
-  const body = `Tap to open • ${host}`;
-
-  // Try thumbnail
-  let thumb = null;
+async function sendLinkCard(m, url, title, thumbUrl) {
+  // thumb buffer (optional)
+  let thumbBuf = null;
   try {
-    thumb = await fetchBuffer(thumIoThumb(url), 900_000);
+    thumbBuf = await new Promise((resolve) => {
+      const lib = thumbUrl.startsWith("https") ? https : http;
+      lib.get(thumbUrl, (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          return resolve(null);
+        }
+        const chunks = [];
+        res.on("data", (d) => chunks.push(d));
+        res.on("end", () => resolve(Buffer.concat(chunks)));
+      }).on("error", () => resolve(null));
+    });
   } catch {
-    thumb = null;
+    thumbBuf = null;
   }
 
-  // The magic: externalAdReply makes a clickable preview card.
-  // Clicking usually opens sourceUrl in WhatsApp browser.
-  const text = `🔗 *LINKSHIELD PRO*\n${title}\n_${body}_`;
+  // 1) Try framework m.send
+  try {
+    if (typeof m.send === "function") {
+      // Some cores support "externalAdReply" via options
+      return await m.send(
+        `🔗 ${title}\n${url}`,
+        {
+          contextInfo: {
+            externalAdReply: {
+              title: title,
+              body: "Tap to open website",
+              mediaType: 1,
+              renderLargerThumbnail: true,
+              showAdAttribution: false,
+              sourceUrl: url,
+              thumbnail: thumbBuf || undefined,
+            },
+          },
+          buttons: [
+            { buttonId: "open_site", buttonText: { displayText: "OPEN WEBSITE" }, type: 1 },
+          ],
+          footer: "KORD LinkCard",
+        },
+        "text"
+      );
+    }
+  } catch {}
 
-  const msg = {
-    text,
-    contextInfo: {
-      externalAdReply: {
-        title,
-        body,
-        thumbnail: thumb || undefined,
-        mediaType: 1,
-        renderLargerThumbnail: true,
-        showAdAttribution: false,
-        sourceUrl: url,
-      },
-    },
-  };
+  // 2) Fallback to Baileys-style direct sendMessage if present
+  try {
+    if (m?.client?.sendMessage) {
+      const jid = m?.key?.remoteJid || m?.chat;
+      const msg = {
+        text: `🔗 ${title}\n${url}`,
+        contextInfo: {
+          externalAdReply: {
+            title,
+            body: "Tap to open website",
+            mediaType: 1,
+            renderLargerThumbnail: true,
+            showAdAttribution: false,
+            sourceUrl: url,
+            thumbnail: thumbBuf || undefined,
+          },
+        },
+      };
+      return await m.client.sendMessage(jid, msg, { quoted: m });
+    }
+  } catch {}
 
-  // Send via client (most reliable)
-  const jid = getChatId(m);
-  if (m?.client?.sendMessage) return m.client.sendMessage(jid, msg, { quoted: m });
-
-  // Fallback
-  if (typeof m.reply === "function") return m.reply(text);
-  return null;
+  // 3) Last fallback: plain text link (still clickable)
+  return m.reply ? m.reply(`${title}\n${url}`) : null;
 }
-
-/* ------------------------ Command ------------------------ */
 
 kord(
-  {
-    cmd: "linkshield|lshield",
-    desc: "Generate a clean clickable link card (title + thumbnail).",
-    fromMe: wtype, // respects your bot's default permission mode
-    type: "tools",
-    react: "🔗",
-  },
+  { cmd: "linkcard|lcard|card|link", desc: "Premium clickable link card", fromMe: wtype, react: "🔗", type: "tools" },
   async (m, text) => {
-    try {
-      const pfx = SAFE_PREFIX();
+    const pfx = SAFE_PREFIX();
+    const raw = String(text || "").trim();
 
-      const raw = String(text || "").trim();
-      if (!raw || raw.toLowerCase() === "help") {
-        return m.reply(
-          `🛡️ *LINKSHIELD PRO*\n\n` +
-            `Usage:\n` +
-            `• ${pfx}linkshield https://example.com\n` +
-            `• ${pfx}lshield https://example.com\n\n` +
-            `Tip:\n` +
-            `You can also paste a sentence containing a URL and it will pick the first link.\n`
-        );
-      }
-
-      const url = isValidHttpUrl(raw) ? raw : extractFirstUrl(raw);
-      if (!url || !isValidHttpUrl(url)) {
-        return m.reply(
-          `❌ Invalid link.\n\n` +
-            `Example:\n` +
-            `${pfx}linkshield https://example.com`
-        );
-      }
-
-      return await sendLinkCard(m, url);
-    } catch (e) {
-      console.log("[linkshield] error:", e);
-      return m.reply ? m.reply("❌ linkshield failed: " + (e?.message || "unknown")) : null;
+    if (!raw) {
+      return m.reply
+        ? m.reply(
+            `🔗 *LinkCard*\n\nUse:\n• ${pfx}linkcard https://example.com\n• ${pfx}card example.com\n\nOptional:\n• ${pfx}setvar LINKCARD_THUMB=https://...jpg\n• ${pfx}setvar LINKCARD_TITLE=My Title`
+          )
+        : null;
     }
+
+    const url = normalizeUrl(raw);
+    const customTitle = getVar("LINKCARD_TITLE", "");
+    const customThumb = getVar("LINKCARD_THUMB", "");
+
+    let title = customTitle;
+    if (!title) {
+      const html = await fetchText(url);
+      title = extractTitle(html) || "Website";
+    }
+
+    const thumbUrl =
+      customThumb ||
+      `https://image.thum.io/get/width/900/crop/700/${encodeURIComponent(url)}`;
+
+    return await sendLinkCard(m, url, title, thumbUrl);
   }
 );
