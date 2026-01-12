@@ -5,6 +5,8 @@ kord({
   desc: "check if bot is online",
   fromMe: false,
   type: "general"
-}, async (m) => {
+}
+, async (m) => {
   await m.send("✅ CRYSNOVA☠️! Bot is alive and running")
-})
+}
+)
