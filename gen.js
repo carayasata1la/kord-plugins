@@ -1,35 +1,67 @@
+/**
+ * GEN v2 — Image (OpenAI) + Video (fal.ai)
+ *
+ * Commands:
+ *  - gen <prompt>     => image
+ *  - fvgen <prompt>   => video (fal.ai)
+ *  - genprovider      => show setup
+ *
+ * Requirements:
+ *  - npm i axios form-data
+ *
+ * ENV:
+ *  - OPENAI_API_KEY
+ *  - FAL_KEY
+ *  - (optional) GEN_OPENAI_MODEL=gpt-image-1
+ *  - (optional) FAL_VIDEO_MODEL=fal-ai/ltx-video
+ */
+
 const axios = require("axios");
-const FormData = require("form-data");
 const { kord } = require("../core");
 
+/* ---------- ENV ---------- */
 const OPENAI_KEY = (process.env.OPENAI_API_KEY || "").trim();
-const STABILITY_KEY = (process.env.STABILITY_KEY || "").trim();
-const HF_TOKEN = (process.env.HF_TOKEN || "").trim();
+const OPENAI_MODEL = (process.env.GEN_OPENAI_MODEL || "gpt-image-1").trim();
 
-function pickProvider() {
-  if (OPENAI_KEY) return "openai";
-  if (STABILITY_KEY) return "stability";
-  if (HF_TOKEN) return "hf";
-  return "";
+const FAL_KEY = (process.env.FAL_KEY || "").trim();
+const FAL_VIDEO_MODEL = (process.env.FAL_VIDEO_MODEL || "fal-ai/ltx-video").trim();
+
+/* ---------- helpers ---------- */
+function short(s, n = 500) {
+  s = String(s || "");
+  return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
 async function sendImage(m, buf, caption) {
-  if (m.client?.sendMessage) {
-    return m.client.sendMessage(
-      m.chat,
-      { image: buf, caption },
-      { quoted: m }
-    );
-  }
-  return m.reply("✅ Image generated (send method fallback)");
+  try {
+    if (typeof m.replyimg === "function") return await m.replyimg(buf, caption || "");
+  } catch {}
+  try {
+    if (m?.client?.sendMessage) {
+      return await m.client.sendMessage(m.chat, { image: buf, caption: caption || "" }, { quoted: m });
+    }
+  } catch {}
+  return m.reply ? m.reply(caption || "✅ Image ready") : null;
 }
 
-/* ---------- OPENAI ---------- */
-async function genOpenAI(prompt) {
+async function sendVideo(m, buf, caption) {
+  try {
+    if (m?.client?.sendMessage) {
+      return await m.client.sendMessage(m.chat, { video: buf, caption: caption || "" }, { quoted: m });
+    }
+  } catch {}
+  return m.reply ? m.reply(caption || "✅ Video ready") : null;
+}
+
+/* ---------- OpenAI IMAGE (FIXED) ---------- */
+async function genImageOpenAI(prompt) {
+  if (!OPENAI_KEY) throw new Error("OPENAI_API_KEY not set.");
+
+  // IMPORTANT: no response_format here
   const r = await axios.post(
     "https://api.openai.com/v1/images/generations",
     {
-      model: "gpt-image-1",
+      model: OPENAI_MODEL,
       prompt,
       size: "1024x1024"
     },
@@ -43,74 +75,107 @@ async function genOpenAI(prompt) {
   );
 
   const b64 = r?.data?.data?.[0]?.b64_json;
-  if (!b64) throw new Error("OpenAI returned no image");
-  return Buffer.from(b64, "base64");
+  if (!b64) {
+    // sometimes providers return a URL style; handle that too
+    const url = r?.data?.data?.[0]?.url;
+    if (url) {
+      const img = await axios.get(url, { responseType: "arraybuffer", timeout: 180000 });
+      return { buffer: Buffer.from(img.data), info: `OpenAI (${OPENAI_MODEL})` };
+    }
+    throw new Error("OpenAI: no image returned.");
+  }
+
+  return { buffer: Buffer.from(b64, "base64"), info: `OpenAI (${OPENAI_MODEL})` };
 }
 
-/* ---------- STABILITY ---------- */
-async function genStability(prompt) {
-  const fd = new FormData();
-  fd.append("prompt", prompt);
-  fd.append("output_format", "png");
+/* ---------- fal.ai VIDEO ---------- */
+async function genVideoFal(prompt) {
+  if (!FAL_KEY) throw new Error("FAL_KEY not set.");
 
-  const r = await axios.post(
-    "https://api.stability.ai/v2beta/stable-image/generate/core",
-    fd,
+  // fal.run REST: POST https://fal.run/<model-id>
+  // Auth: Authorization: Key <FAL_KEY>
+  const start = await axios.post(
+    `https://fal.run/${encodeURIComponent(FAL_VIDEO_MODEL)}`,
+    { prompt },
     {
       headers: {
-        Authorization: `Bearer ${STABILITY_KEY}`,
-        ...fd.getHeaders()
+        Authorization: `Key ${FAL_KEY}`,
+        "Content-Type": "application/json"
       },
-      responseType: "arraybuffer",
-      timeout: 180000
+      timeout: 120000
     }
   );
 
-  return Buffer.from(r.data);
+  // typical response includes video.url (model dependent)
+  const videoUrl =
+    start?.data?.video?.url ||
+    start?.data?.output?.video?.url ||
+    start?.data?.data?.video?.url ||
+    start?.data?.result?.video?.url;
+
+  if (!videoUrl) {
+    // fallback: return JSON snippet for debugging
+    throw new Error("fal.ai: video URL not found in response.");
+  }
+
+  const vid = await axios.get(videoUrl, { responseType: "arraybuffer", timeout: 300000 });
+  return { buffer: Buffer.from(vid.data), info: `fal.ai (${FAL_VIDEO_MODEL})` };
 }
 
-/* ---------- HUGGINGFACE ---------- */
-async function genHF(prompt) {
-  const model = "black-forest-labs/FLUX.1-schnell";
-  const r = await axios.post(
-    `https://api-inference.huggingface.co/models/${model}`,
-    { inputs: prompt },
-    {
-      headers: { Authorization: `Bearer ${HF_TOKEN}` },
-      responseType: "arraybuffer",
-      timeout: 180000
-    }
-  );
-  return Buffer.from(r.data);
-}
-
-/* ---------- COMMAND ---------- */
+/* ---------- COMMANDS ---------- */
 kord(
-  { cmd: "gen", desc: "Generate AI image", type: "tools", react: "🖼️" },
-  async (m, text) => {
+  { cmd: "genprovider", desc: "Show GEN provider setup", type: "tools", react: "⚙️" },
+  async (m) => {
+    const okOpenAI = OPENAI_KEY ? "✅" : "❌";
+    const okFal = FAL_KEY ? "✅" : "❌";
+    return m.reply(
+      "⚙️ *GEN Setup*\n" +
+        `• Image: OpenAI Images API: ${okOpenAI}\n` +
+        `  - Model: ${OPENAI_MODEL}\n` +
+        `• Video: fal.ai: ${okFal}\n` +
+        `  - Model: ${FAL_VIDEO_MODEL}\n\n` +
+        "Commands:\n" +
+        "• gen <prompt>\n" +
+        "• fvgen <prompt>"
+    );
+  }
+);
+
+kord(
+  { cmd: "gen", desc: "Generate AI image (OpenAI)", type: "tools", react: "🖼️" },
+  async (m, arg) => {
     try {
-      const prompt = String(text || "").trim();
+      const prompt = String(arg || "").trim();
       if (!prompt) return m.reply("❌ Use: gen <prompt>");
-
-      const provider = pickProvider();
-      if (!provider) {
-        return m.reply("❌ No image provider configured.");
-      }
-
       await m.reply("✨ Generating image…");
-
-      let img;
-      if (provider === "openai") img = await genOpenAI(prompt);
-      else if (provider === "stability") img = await genStability(prompt);
-      else img = await genHF(prompt);
-
-      return sendImage(
+      const { buffer, info } = await genImageOpenAI(prompt);
+      return await sendImage(
         m,
-        img,
-        `🖼️ GEN\n• Provider: ${provider}\n• Prompt: ${prompt.slice(0, 300)}`
+        buffer,
+        "🖼️ *GEN*\n" + `• Engine: ${info}\n` + `• Prompt: ${short(prompt, 300)}`
       );
     } catch (e) {
-      return m.reply("❌ GEN error: " + (e?.message || e));
+      return m.reply("❌ GEN error: " + (e?.response?.data?.error?.message || e?.message || e));
+    }
+  }
+);
+
+kord(
+  { cmd: "fvgen", desc: "Generate AI video (fal.ai)", type: "tools", react: "🎬" },
+  async (m, arg) => {
+    try {
+      const prompt = String(arg || "").trim();
+      if (!prompt) return m.reply("❌ Use: fvgen <prompt>");
+      if (!FAL_KEY) return m.reply("❌ Set FAL_KEY in your panel env first.");
+      await m.reply("🎬 Generating video…");
+      const { buffer, info } = await genVideoFal(prompt);
+      return await sendVideo(
+        m,
+        buffer,
+        "🎬 *FVGEN*\n" + `• Engine: ${info}\n` + `• Prompt: ${short(prompt, 250)}`
+      );
+    } catch (e) {
+      return m.reply("❌ FVGEN error: " + (e?.response?.data?.message || e?.message || e));
     }
   }
 );
