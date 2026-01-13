@@ -1,31 +1,4 @@
-/**
- * CRYSNOVA AI v1 — Premium Assistant (Canvas Menu + Persistent Memory + AI Roasts)
- *
- * Commands:
- *  - crysnova menu
- *  - crysnova help
- *  - crysnova setup
- *  - crysnova chat <msg>
- *  - crysnova coach <msg>
- *  - crysnova writer <msg>
- *  - crysnova coder <msg>
- *  - crysnova translate <text>
- *  - crysnova summarize   (reply to a message)
- *
- *  - crysnova roast            (roast yourself)
- *  - crysnova roast @user      (roast mentioned user)
- *  - crysnova lastroast        (reply to message then use)
- *  - crysnova roastlevel <soft|medium|savage>
- *
- *  - crysnova weather <city>
- *  - crysnova setcity <city>
- *  - crysnova music <query>
- *
- *  - crysnova mem
- *  - crysnova memclear
- *
- * Deps: axios, openai, canvas
- */
+/* [CRYSNOVA PART 1 / 3] */
 
 const fs = require("fs");
 const path = require("path");
@@ -110,9 +83,7 @@ async function sendText(m, txt, opt = {}) {
   return null;
 }
 async function sendImage(m, buf, caption = "", opt = {}) {
-  try {
-    if (typeof m.replyimg === "function") return await m.replyimg(buf, caption);
-  } catch {}
+  try { if (typeof m.replyimg === "function") return await m.replyimg(buf, caption); } catch {}
   try {
     if (m?.client?.sendMessage) {
       return await m.client.sendMessage(getChatId(m), { image: buf, caption, ...opt }, { quoted: m });
@@ -158,7 +129,7 @@ function setPrefs(m, patch) {
   return db.users[k];
 }
 
-/* ----------------- MEMORY (persistent rolling) ----------------- */
+/* ----------------- MEMORY ----------------- */
 function memCap() {
   const v = parseInt(getVar("CRYS_MEM", "24"), 10);
   return Math.max(8, Math.min(80, Number.isFinite(v) ? v : 24));
@@ -210,7 +181,7 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const MODEL = (process.env.CRYS_MODEL || "gpt-4o-mini").trim();
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
-/* ----------------- CANVAS MENU (premium) ----------------- */
+/* ----------------- CANVAS MENU ----------------- */
 const THEMES = {
   neon:   { neon:"#27ff9a", dim:"#eafff6", border:"#1ccf7b", panel:"rgba(6,24,15,0.72)" },
   ice:    { neon:"#7df3ff", dim:"#e8fbff", border:"#3ad7ff", panel:"rgba(6,16,24,0.72)" },
@@ -256,7 +227,6 @@ async function makeMenuCard(title, lines, size = 900) {
   const canvas = createCanvas(w, h);
   const ctx = canvas.getContext("2d");
 
-  // background
   const bg = bgUrl();
   if (bg) {
     try {
@@ -272,26 +242,22 @@ async function makeMenuCard(title, lines, size = 900) {
     ctx.fillStyle = "#06130d"; ctx.fillRect(0, 0, w, h);
   }
 
-  // overlay + panel
   ctx.fillStyle = "rgba(0,0,0,0.48)"; ctx.fillRect(0, 0, w, h);
   ctx.strokeStyle = theme.border; ctx.lineWidth = 3;
   ctx.strokeRect(14, 14, w - 28, h - 28);
   ctx.fillStyle = theme.panel;
   ctx.fillRect(24, 24, w - 48, h - 48);
 
-  // title
   ctx.font = `bold ${Math.round(size * 0.055)}px Sans`;
   ctx.fillStyle = theme.neon;
   ctx.fillText(title, pad, pad + Math.round(size * 0.06));
 
-  // divider
   ctx.strokeStyle = theme.border; ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(pad, pad + titleH);
   ctx.lineTo(w - pad, pad + titleH);
   ctx.stroke();
 
-  // body
   ctx.font = `${Math.round(size * 0.033)}px Sans`;
   ctx.fillStyle = theme.dim;
 
@@ -301,19 +267,19 @@ async function makeMenuCard(title, lines, size = 900) {
     y += lineH;
   }
 
-  // footer
   ctx.font = `${Math.round(size * 0.028)}px Sans`;
   ctx.fillStyle = theme.neon;
   ctx.fillText("CRYSNOVA AI • PREMIUM", pad, h - pad);
 
   return canvas.toBuffer("image/png");
 }
+/* [CRYSNOVA PART 2 / 3] */
 
-/* ----------------- FEATURES ----------------- */
+/* ----------------- AI SYSTEM ----------------- */
 function baseSystem(mode) {
   const modeHint = {
     chat: "Be friendly, sharp, Nigerian-street-smart but respectful. English + small Pidgin mix when it fits.",
-    coach: "Be a practical coach. Give steps, plans, checklists. Ask 1 quick question only if needed.",
+    coach: "Be a practical coach. Give steps, plans, checklists.",
     writer: "Write premium content: captions, bios, scripts, hooks. Give 3 options + best pick.",
     coder: "Debug + explain simply. Give clean code and how to paste it into KORD plugins.",
     translate: "Translate cleanly. Keep meaning + tone. If Pidgin requested, do Naija Pidgin well.",
@@ -362,7 +328,7 @@ async function aiReply(m, userText, mode = "chat") {
 async function getWeather(city) {
   const apiKey = (process.env.OPENWEATHER_API_KEY || "").trim();
   if (!apiKey) return "Weather not configured: set OPENWEATHER_API_KEY.";
-  const url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${apiKey}&units=metric`;
+  const url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${encodeURIComponent(apiKey)}&units=metric`;
   const res = await axios.get(url, { timeout: 20000 });
   const w = res.data;
   return (
@@ -390,7 +356,7 @@ async function searchMusic(query) {
   };
 }
 
-/* ----------------- MAIN COMMAND ----------------- */
+/* ----------------- MENU ----------------- */
 function menuLines() {
   const p = SAFE_PREFIX();
   return [
@@ -416,18 +382,26 @@ function menuLines() {
     `${p}crysnova setcity <city>`,
     `${p}crysnova music <query>`,
     "",
+    "AUTO-REPLY (tags / reply-to-bot)",
+    `${p}crysnova on`,
+    `${p}crysnova off`,
+    `${p}crysnova status`,
+    `${p}crysnova automode on`,
+    `${p}crysnova automode off`,
+    `${p}crysnova mode <chat|coach|writer|coder|translate>`,
+    "",
     "MEMORY",
     `${p}crysnova mem`,
     `${p}crysnova memclear`
   ];
 }
-
 async function sendMenu(m) {
   const img = await makeMenuCard("CRYSNOVA AI", menuLines(), 900);
   if (img) return sendImage(m, img, "");
   return sendText(m, "CRYSNOVA AI\n\n" + menuLines().join("\n"));
 }
 
+/* ----------------- ROAST ----------------- */
 function roastLevelOf(m) {
   const p = getPrefs(m);
   return (p.roastlevel || "medium").toLowerCase();
@@ -438,7 +412,6 @@ function setRoastLevel(m, lvl) {
   setPrefs(m, { roastlevel: lvl });
   return lvl;
 }
-
 async function doRoast(m, targetLabel) {
   const lvl = roastLevelOf(m);
   const instruction =
@@ -453,12 +426,124 @@ async function doRoast(m, targetLabel) {
   );
   return text.replace(/\s+/g, " ").trim();
 }
+/* [CRYSNOVA PART 3 / 3] */
 
-/* ----------------- COMMAND ROUTER ----------------- */
+/* ----------------- AUTO SESSION (ON/OFF + SMART MODE) ----------------- */
+function envStr(name, fallback = "") {
+  const v = process.env?.[name];
+  return v !== undefined && v !== null ? String(v).trim() : fallback;
+}
+function ownerJidHard() {
+  return envStr("CRYS_OWNER_JID", "");
+}
+function botJidGuess(m) {
+  try {
+    const id = m?.client?.user?.id || m?.client?.user?.jid || m?.user || "";
+    return String(id || "").trim();
+  } catch {
+    return "";
+  }
+}
+function isEnabled(m) {
+  const p = getPrefs(m);
+  return !!p.enabled;
+}
+function setEnabled(m, v) {
+  setPrefs(m, { enabled: !!v });
+  return !!v;
+}
+function isAutoMode(m) {
+  const p = getPrefs(m);
+  if (typeof p.automode === "boolean") return p.automode;
+  return true;
+}
+function setAutoMode(m, v) {
+  setPrefs(m, { automode: !!v });
+  return !!v;
+}
+function getFixedMode(m) {
+  const p = getPrefs(m);
+  const v = (p.fixedmode || "chat").toLowerCase();
+  return ["chat","coach","writer","coder","translate"].includes(v) ? v : "chat";
+}
+function setFixedMode(m, v) {
+  v = String(v || "").toLowerCase();
+  if (!["chat","coach","writer","coder","translate"].includes(v)) return null;
+  setPrefs(m, { fixedmode: v });
+  return v;
+}
+
+const AUTO_CD = new Map();
+function autoCooldownSec() {
+  const n = parseInt(envStr("CRYS_AUTOREPLY_COOLDOWN", "2"), 10);
+  if (!Number.isFinite(n)) return 2;
+  return Math.max(0, Math.min(10, n));
+}
+function hitAutoCooldown(m) {
+  const s = autoCooldownSec();
+  if (!s) return false;
+  const k = `${getChatId(m)}::AUTO`;
+  const now = Date.now();
+  const last = AUTO_CD.get(k) || 0;
+  if (now - last < s * 1000) return true;
+  AUTO_CD.set(k, now);
+  return false;
+}
+function isCommandText(t) {
+  const p = SAFE_PREFIX();
+  const s = String(t || "").trim();
+  return !!(p && s.startsWith(p));
+}
+function shouldAutoReply(m) {
+  if (!isEnabled(m)) return false;
+  if (m?.fromMe) return false;
+  if (m?.isBot) return false;
+  if (m?.isBaileys) return false;
+
+  const raw =
+    m?.message?.conversation ||
+    m?.message?.extendedTextMessage?.text ||
+    m?.text ||
+    m?.body ||
+    "";
+  if (isCommandText(raw)) return false;
+
+  const ownerJid = ownerJidHard();
+  const botJid = botJidGuess(m);
+
+  if (ownerJid && Array.isArray(m?.mentionedJid) && m.mentionedJid.includes(ownerJid)) return true;
+  if (botJid && Array.isArray(m?.mentionedJid) && m.mentionedJid.includes(botJid)) return true;
+  if (m?.quoted && (m.quoted?.fromMe || m.quoted?.isBot)) return true;
+
+  return false;
+}
+function smartModeFromText(txt) {
+  const t = String(txt || "").toLowerCase().trim();
+  if (!t) return "chat";
+
+  if (t.startsWith("translate") || t.includes(" translate ") || t.includes(" into ") || t.includes(" to pidgin") || t.includes(" to french") || t.includes(" to english")) {
+    return "translate";
+  }
+  if (t.startsWith("summarize") || t.includes(" summarize ") || t.includes(" summary ") || t.includes(" key points") || t.includes(" tl;dr")) {
+    return "summarize";
+  }
+  if (t.includes("error") || t.includes("bug") || t.includes("fix") || t.includes("syntax") || t.includes("stack") || t.includes("node") || t.includes("npm") || t.includes("plugin") || t.includes("kord") || t.includes("js code") || t.includes("javascript")) {
+    return "coder";
+  }
+  if (t.includes("caption") || t.includes("bio") || t.includes("script") || t.includes("hook") || t.includes("copywriting") || t.includes("write") || t.includes("rewrite") || t.includes("content")) {
+    return "writer";
+  }
+  if (t.includes("plan") || t.includes("steps") || t.includes("strategy") || t.includes("how do i") || t.includes("what should i") || t.includes("guide") || t.includes("checklist")) {
+    return "coach";
+  }
+  return "chat";
+}
+
+/* ----------------- MAIN COMMAND ROUTER ----------------- */
 kord(
   {
     cmd: "crysnova|crys",
-    desc: "Crysnova AI (premium assistant)",
+    desc: "Crysnova AI (premium assistant + auto tag reply)",
     fromMe: wtype,
     type: "tools",
     react: "💎",
@@ -476,98 +561,100 @@ kord(
       if (sub === "setup") {
         const okAI = OPENAI_API_KEY ? "✅" : "❌";
         const okW = (process.env.OPENWEATHER_API_KEY || "").trim() ? "✅" : "❌";
+        const okOwner = ownerJidHard() ? "✅" : "❌";
         return sendText(
           m,
-          `CRYSNOVA SETUP\n` +
-          `AI Key: ${okAI}\n` +
-          `Weather Key: ${okW}\n` +
-          `Model: ${MODEL}\n` +
-          `Memory: ${memCap()} (rolling)\n` +
-          `Cooldown: ${cdSec()}s\n` +
-          `Theme: ${(process.env.CRYS_THEME || "neon")}\n\n` +
-          `Try: ${p}crysnova menu`
+          `CRYSNOVA SETUP\nAI Key: ${okAI}\nWeather Key: ${okW}\nCRYS_OWNER_JID: ${okOwner}\nModel: ${MODEL}\nMemory: ${memCap()} (rolling)\nCooldown: ${cdSec()}s\nAuto Cooldown: ${autoCooldownSec()}s\nTheme: ${(process.env.CRYS_THEME || "neon")}`
         );
       }
 
-      // MEMORY
-      if (sub === "mem") {
-        const hist = loadMem(m);
-        return sendText(m, `Memory turns saved: ${hist.length}/${memCap()}`);
+      if (sub === "on") {
+        setEnabled(m, true);
+        return sendText(m, "CRYSNOVA Auto-Reply: ON\nTurn off: crysnova off");
       }
-      if (sub === "memclear") {
-        clearMem(m);
-        return sendText(m, "Memory cleared for this chat/user.");
+      if (sub === "off") {
+        setEnabled(m, false);
+        return sendText(m, "CRYSNOVA Auto-Reply: OFF");
+      }
+      if (sub === "status") {
+        return sendText(
+          m,
+          `CRYSNOVA Auto-Reply Status\nState: ${isEnabled(m) ? "ON" : "OFF"}\nAutoMode: ${isAutoMode(m) ? "ON" : "OFF"}\nFixed Mode: ${getFixedMode(m)}`
+        );
+      }
+      if (sub === "automode") {
+        const v = rest.toLowerCase();
+        if (v !== "on" && v !== "off") return sendText(m, `Use: ${p}crysnova automode on|off`);
+        setAutoMode(m, v === "on");
+        return sendText(m, `AutoMode: ${v.toUpperCase()}`);
+      }
+      if (sub === "mode") {
+        const v = setFixedMode(m, rest);
+        if (!v) return sendText(m, `Use: ${p}crysnova mode chat|coach|writer|coder|translate`);
+        return sendText(m, `Fixed Mode set: ${v}`);
       }
 
-      // ROAST SETTINGS
+      if (sub === "mem") return sendText(m, `Memory turns saved: ${loadMem(m).length}/${memCap()}`);
+      if (sub === "memclear") { clearMem(m); return sendText(m, "Memory cleared for this chat/user."); }
+
       if (sub === "roastlevel") {
         const lvl = setRoastLevel(m, rest);
-        if (!lvl) return sendText(m, "Use: crysnova roastlevel soft|medium|savage");
+        if (!lvl) return sendText(m, `Use: ${p}crysnova roastlevel soft|medium|savage`);
         return sendText(m, `Roast level set: ${lvl}`);
       }
 
-      // WEATHER
       if (sub === "setcity") {
-        if (!rest) return sendText(m, "Use: crysnova setcity <city>");
+        if (!rest) return sendText(m, `Use: ${p}crysnova setcity <city>`);
         setPrefs(m, { city: rest });
         return sendText(m, `Default city set: ${rest}`);
       }
       if (sub === "weather") {
         const prefs = getPrefs(m);
         const city = rest || prefs.city;
-        if (!city) return sendText(m, "Use: crysnova weather <city>  (or set default with crysnova setcity <city>)");
-        const rep = await getWeather(city);
-        return sendText(m, rep);
+        if (!city) return sendText(m, `Use: ${p}crysnova weather <city>`);
+        return sendText(m, await getWeather(city));
       }
 
-      // MUSIC
       if (sub === "music") {
-        if (!rest) return sendText(m, "Use: crysnova music <song or artist>");
+        if (!rest) return sendText(m, `Use: ${p}crysnova music <song or artist>`);
         const result = await searchMusic(rest);
         await sendText(m, result.text);
-        if (result.preview) {
+        if (result.preview && m?.client?.sendMessage) {
           try {
-            if (m?.client?.sendMessage) {
-              return await m.client.sendMessage(getChatId(m), { audio: { url: result.preview }, mimetype: "audio/mp4" }, { quoted: m });
-            }
+            return await m.client.sendMessage(getChatId(m), { audio: { url: result.preview }, mimetype: "audio/mp4" }, { quoted: m });
           } catch {}
         }
         return null;
       }
 
-      // SUMMARIZE QUOTED
       if (sub === "summarize") {
         const quoted = m?.quoted;
         const qtxt = quoted?.text || quoted?.msg || "";
-        if (!qtxt) return sendText(m, "Reply to a message then use: crysnova summarize");
+        if (!qtxt) return sendText(m, `Reply to a message then use: ${p}crysnova summarize`);
         const out = await aiReply(m, `Summarize this:\n\n${qtxt}`, "summarize");
         return sendText(m, out);
       }
 
-      // ROAST (self / mention / lastroast)
       if (sub === "roast") {
         if (m?.mentionedJid?.length) {
           const user = m.mentionedJid[0];
           const roast = await doRoast(m, `@${user.split("@")[0]}`);
           return sendText(m, withMentions(`${roast}`, [user]));
         }
-        const roast = await doRoast(m, "me");
-        return sendText(m, roast);
+        return sendText(m, await doRoast(m, "me"));
       }
       if (sub === "lastroast") {
         const q = m?.quoted;
-        if (!q) return sendText(m, "Reply to someone’s message, then use: crysnova lastroast");
+        if (!q) return sendText(m, `Reply then use: ${p}crysnova lastroast`);
         const user = q.sender;
         const roast = await doRoast(m, `@${String(user || "").split("@")[0] || "user"}`);
         return sendText(m, withMentions(`${roast}`, user ? [user] : []));
       }
 
-      // AI MODES
       const modeMap = new Set(["chat","coach","writer","coder","translate"]);
       if (modeMap.has(sub)) {
         if (!rest) return sendText(m, `Use: ${p}crysnova ${sub} <message>`);
-        const out = await aiReply(m, rest, sub);
-        return sendText(m, out);
+        return sendText(m, await aiReply(m, rest, sub));
       }
 
       return sendText(m, `Unknown. Try: ${p}crysnova menu`);
@@ -576,5 +663,39 @@ kord(
     }
   }
 );
+
+/* ----------------- AUTO-REPLY LISTENER ----------------- */
+kord({ on: "all" }, async (m, textArg) => {
+  try {
+    if (!shouldAutoReply(m)) return;
+    if (hitAutoCooldown(m)) return;
+    if (!openai) return;
+
+    const msg = getTextFromAny(m, textArg).trim();
+    if (!msg) return;
+
+    let mode = "chat";
+    if (isAutoMode(m)) {
+      mode = smartModeFromText(msg);
+      if (mode === "summarize" && !m?.quoted) mode = "chat";
+    } else {
+      mode = getFixedMode(m);
+    }
+
+    if (mode === "summarize" && m?.quoted) {
+      const qtxt = m.quoted?.text || m.quoted?.msg || "";
+      if (qtxt) {
+        const out = await aiReply(m, `Summarize this:\n\n${qtxt}`, "summarize");
+        return await sendText(m, out);
+      }
+      mode = "chat";
+    }
+
+    const out = await aiReply(m, msg, mode);
+    return await sendText(m, out);
+  } catch {
+    return;
+  }
+});
 
 module.exports = {};
