@@ -1,40 +1,3 @@
-/**
- * CRYSNOVA AI v1.2 — Premium Assistant + Auto-Reply Session (FIXED)
- *
- * Deps: axios, openai, canvas
- * Install: npm i axios openai canvas
- *
- * ENV:
- *  - OPENAI_API_KEY=...
- *  - CRYS_MODEL=gpt-4o-mini (optional)
- *  - CRYS_THEME=neon|ice|purple|gold (optional)
- *  - CRYS_MENU_BG=https://... (optional)
- *  - OPENWEATHER_API_KEY=... (optional for weather)
- *  - CRYS_MEM=24 (optional)
- *  - CRYS_COOLDOWN=5 (optional)
- *  - CRYS_AUTOREPLY_COOLDOWN=2 (optional)
- *
- * Commands:
- *  - .crysnova menu
- *  - .crysnova setup
- *  - .crysnova chat <msg>
- *  - .crysnova coach <msg>
- *  - .crysnova writer <msg>
- *  - .crysnova coder <msg>
- *  - .crysnova translate <text>
- *  - .crysnova summarize (reply)
- *  - .crysnova roast | .crysnova roast @user | .crysnova lastroast (reply)
- *  - .crysnova roastlevel <soft|medium|savage>
- *  - .crysnova weather <city> | .crysnova setcity <city>
- *  - .crysnova music <query>
- *  - .crysnova mem | .crysnova memclear
- *
- * Auto Reply (SESSION PER CHAT = replies to everybody):
- *  - .crysnovaon   (owner/mod/sudo only)
- *  - .crysnovaoff  (owner/mod/sudo only)
- *  - .crysnovastatus
- */
-
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
@@ -90,9 +53,7 @@ function isAllowed(m) {
   const sudoRaw = cfg?.SUDO || cfg?.SUDO_USERS || cfg?.SUDOS;
   const sender = getSenderId(m);
   if (sudoRaw && sender) {
-    const list = Array.isArray(sudoRaw)
-      ? sudoRaw
-      : String(sudoRaw).split(",").map(x => x.trim()).filter(Boolean);
+    const list = Array.isArray(sudoRaw) ? sudoRaw : String(sudoRaw).split(",").map(x=>x.trim()).filter(Boolean);
     if (list.includes(sender)) return true;
   }
   return false;
@@ -113,27 +74,25 @@ async function sendText(m, txt, opt = {}) {
   try { if (typeof m.send === "function") return await m.send(txt, opt); } catch {}
   try {
     if (m?.client?.sendMessage) {
-      return await m.client.sendMessage(getChatId(m), { text: String(txt || ""), ...opt }, { quoted: m });
+      return await m.client.sendMessage(getChatId(m), { text: txt, ...opt }, { quoted: m });
     }
   } catch {}
-  try { if (typeof m.reply === "function") return await m.reply(String(txt || "")); } catch {}
+  try { if (typeof m.reply === "function") return await m.reply(txt); } catch {}
   return null;
 }
-async function sendImage(m, buf, caption = "") {
-  try { if (typeof m.replyimg === "function") return await m.replyimg(buf, caption); } catch {}
+async function sendImage(m, buf, caption = "", opt = {}) {
+  try {
+    if (typeof m.replyimg === "function") return await m.replyimg(buf, caption);
+  } catch {}
   try {
     if (m?.client?.sendMessage) {
-      return await m.client.sendMessage(getChatId(m), { image: buf, caption: caption || "" }, { quoted: m });
+      return await m.client.sendMessage(getChatId(m), { image: buf, caption, ...opt }, { quoted: m });
     }
   } catch {}
-  return sendText(m, caption || "✅");
+  return sendText(m, caption || "✅", opt);
 }
 function withMentions(text, jids) {
   return { text, mentions: Array.isArray(jids) ? jids : [] };
-}
-function short(s, n = 700) {
-  s = String(s || "");
-  return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
 /* ----------------- STORAGE ----------------- */
@@ -145,7 +104,7 @@ const PREF_FILE = path.join(DATA_DIR, "prefs.json");
 function ensureDirs() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(MEM_FILE)) fs.writeFileSync(MEM_FILE, JSON.stringify({ users: {} }, null, 2));
-  if (!fs.existsSync(PREF_FILE)) fs.writeFileSync(PREF_FILE, JSON.stringify({ users: {}, chats: {} }, null, 2));
+  if (!fs.existsSync(PREF_FILE)) fs.writeFileSync(PREF_FILE, JSON.stringify({ users: {} }, null, 2));
 }
 function readJSON(file, fallback) {
   ensureDirs();
@@ -155,10 +114,12 @@ function writeJSON(file, obj) {
   ensureDirs();
   fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf8");
 }
-
-/* ----------------- USER PREFS (per chat+sender) ----------------- */
 function ukey(m) {
   return `${getChatId(m)}::${getSenderId(m)}`;
+}
+function chatKey(m) {
+  // group-wide session per chat (NOT per user)
+  return `${getChatId(m)}`;
 }
 function getPrefs(m) {
   const db = readJSON(PREF_FILE, { users: {}, chats: {} });
@@ -171,24 +132,18 @@ function setPrefs(m, patch) {
   writeJSON(PREF_FILE, db);
   return db.users[k];
 }
-
-/* ----------------- CHAT SESSION (FIX: per chat, not per user) ----------------- */
-function chatKey(m) {
-  return String(getChatId(m) || "unknown");
-}
-function getChatSession(m) {
+function getChatPrefs(m) {
   const db = readJSON(PREF_FILE, { users: {}, chats: {} });
-  db.chats = db.chats || {};
   return db.chats[chatKey(m)] || {};
 }
-function setChatSession(m, patch) {
+function setChatPrefs(m, patch) {
   const db = readJSON(PREF_FILE, { users: {}, chats: {} });
-  db.chats = db.chats || {};
   const k = chatKey(m);
-  db.chats[k] = { ...(db.chats[k] || {}), ...patch, updatedAt: Date.now() };
+  db.chats[k] = { ...(db.chats[k] || {}), ...patch };
   writeJSON(PREF_FILE, db);
   return db.chats[k];
 }
+
 /* ----------------- MEMORY (rolling) ----------------- */
 function memCap() {
   const v = parseInt(getVar("CRYS_MEM", "24"), 10);
@@ -219,20 +174,16 @@ function clearMem(m) {
 /* ----------------- COOLDOWN ----------------- */
 const COOLDOWN = new Map();
 function cdSec() {
-  const v = parseInt(getVar("CRYS_COOLDOWN", "5"), 10);
-  return Math.max(0, Math.min(30, Number.isFinite(v) ? v : 5));
+  const v = parseInt(getVar("CRYS_COOLDOWN", "6"), 10);
+  return Math.max(0, Math.min(30, Number.isFinite(v) ? v : 6));
 }
-function checkCooldown(m) {
+function checkCooldownKey(key) {
   const s = cdSec();
   if (!s) return null;
-  const k = ukey(m);
   const now = Date.now();
-  const last = COOLDOWN.get(k) || 0;
-  if (now - last < s * 1000) {
-    const left = Math.ceil((s * 1000 - (now - last)) / 1000);
-    return left;
-  }
-  COOLDOWN.set(k, now);
+  const last = COOLDOWN.get(key) || 0;
+  if (now - last < s * 1000) return Math.ceil((s * 1000 - (now - last)) / 1000);
+  COOLDOWN.set(key, now);
   return null;
 }
 
@@ -240,6 +191,60 @@ function checkCooldown(m) {
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const MODEL = (process.env.CRYS_MODEL || "gpt-4o-mini").trim();
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+
+/* ----------------- SESSION + MODE ----------------- */
+function sessionState(m) {
+  // per chat session
+  const c = getChatPrefs(m);
+  return {
+    on: !!c.session_on,
+    mode: (c.session_mode || "tag").toLowerCase(), // tag | all
+  };
+}
+function setSession(m, on) {
+  return setChatPrefs(m, { session_on: !!on });
+}
+function setMode(m, mode) {
+  mode = String(mode || "").toLowerCase();
+  if (!["tag", "all"].includes(mode)) return null;
+  setChatPrefs(m, { session_mode: mode });
+  return mode;
+}
+
+function getBotJid(m) {
+  const a = m?.client?.user?.id || m?.client?.user?.jid || m?.user?.id || "";
+  if (a && typeof a === "string") return a.includes("@") ? a : `${a}@s.whatsapp.net`;
+  const cfg = getCfgAny();
+  const bn = cfg?.BOT_NUMBER || cfg?.BOTNUM || cfg?.NUMBER;
+  if (bn) return `${String(bn).replace(/\D/g, "")}@s.whatsapp.net`;
+  return "";
+}
+
+function getOwnerJidGuess() {
+  const cfg = getCfgAny();
+  const n = cfg?.OWNER_NUMBER || cfg?.OWNER || cfg?.OWNERNUM || "";
+  const digits = String(n || "").replace(/\D/g, "");
+  return digits ? `${digits}@s.whatsapp.net` : "";
+}
+
+function isTaggedForSession(m) {
+  const mentioned = Array.isArray(m?.mentionedJid) ? m.mentionedJid : [];
+  if (!mentioned.length) return false;
+
+  const bot = getBotJid(m);
+  const owner = getOwnerJidGuess();
+
+  if (bot && mentioned.includes(bot)) return true;
+  if (owner && mentioned.includes(owner)) return true;
+
+  // also accept if bot number tagged without @s.whatsapp.net match (some cores)
+  const botNum = bot ? bot.split("@")[0] : "";
+  const ownerNum = owner ? owner.split("@")[0] : "";
+  return mentioned.some(j => {
+    const num = String(j).split("@")[0];
+    return (botNum && num === botNum) || (ownerNum && num === ownerNum);
+  });
+}
 
 /* ----------------- CANVAS MENU ----------------- */
 const THEMES = {
@@ -274,7 +279,6 @@ function fetchBuffer(url) {
 }
 async function makeMenuCard(title, lines, size = 900) {
   if (!Canvas) return null;
-
   const { createCanvas, loadImage } = Canvas;
   const theme = themeNow();
 
@@ -322,55 +326,60 @@ async function makeMenuCard(title, lines, size = 900) {
   ctx.fillStyle = theme.dim;
 
   let y = pad + titleH + Math.round(size * 0.055);
-  for (const ln of lines) {
-    ctx.fillText(String(ln), pad, y);
-    y += lineH;
-  }
+  for (const ln of lines) { ctx.fillText(String(ln), pad, y); y += lineH; }
 
   ctx.font = `${Math.round(size * 0.028)}px Sans`;
   ctx.fillStyle = theme.neon;
-  ctx.fillText("CRYSNOVA AI • PREMIUM", pad, h - pad);
+  ctx.fillText("CRYSNOVA AI • SESSION MODE", pad, h - pad);
 
   return canvas.toBuffer("image/png");
 }
 
+/* [PART 1 END] */
+/* [CRYSNOVA AI v2 — PART 2 / 3] */
+
 /* ----------------- AI CORE ----------------- */
 function baseSystem(mode) {
   const modeHint = {
-    chat: "Be friendly, sharp, Nigerian-street-smart but respectful. Mostly English with small Pidgin when it fits.",
-    coach: "Be practical. Give steps, checklists, plans.",
-    writer: "Write premium content. Provide 3 options + best pick.",
-    coder: "Explain simply. Give clean code ready for KORD plugins.",
-    translate: "Translate cleanly and preserve tone.",
-    summarize: "Summarize into bullets + actions.",
-    roast: "Playful banter only. No slurs, hate, threats, or family curses."
+    chat: "Be friendly, sharp, Nigerian-street-smart but respectful. English + small Pidgin mix when it fits.",
+    coach: "Be a practical coach. Give steps, plans, checklists.",
+    writer: "Write premium content: captions, bios, scripts, hooks. Give 3 options + best pick.",
+    coder: "Debug + explain simply. Give clean code and how to paste it into KORD plugins.",
+    translate: "Translate cleanly. Keep meaning + tone. If Pidgin requested, do Naija Pidgin well.",
+    summarize: "Summarize clearly into bullets, actions, and key points.",
+    roast: "Generate playful banter only. No slurs, no hate, no threats, no family curses. Keep it witty.",
+    auto: "You are replying in a WhatsApp group. Keep it short, helpful, and natural. Avoid long essays."
   }[mode] || "Be helpful.";
 
   return (
     "You are CRYSNOVA AI, a premium WhatsApp assistant.\n" +
     "Rules:\n" +
-    "- Be concise and premium.\n" +
-    "- Never output hate, slurs, threats, doxxing.\n" +
+    "- Keep responses concise but premium.\n" +
+    "- Never output hate, slurs, threats, doxxing, or sexual content.\n" +
+    "- If asked for harmful content, refuse and redirect.\n" +
     "Mode:\n" + modeHint
   );
 }
 
 async function aiReply(m, userText, mode = "chat") {
   if (!openai) throw new Error("OPENAI_API_KEY not set.");
-  const left = checkCooldown(m);
+
+  // cooldown per chat session, not per user
+  const cdKey = "chat::" + getChatId(m);
+  const left = checkCooldownKey(cdKey);
   if (left) throw new Error(`Cooldown: wait ${left}s`);
 
   const history = loadMem(m).map(x => ({ role: x.role, content: x.content }));
   const messages = [
     { role: "system", content: baseSystem(mode) },
     ...history.slice(-memCap()),
-    { role: "user", content: String(userText || "").slice(0, 8000) }
+    { role: "user", content: userText }
   ];
 
   const resp = await openai.chat.completions.create({
     model: MODEL,
     messages,
-    temperature: mode === "roast" ? 0.95 : 0.7,
+    temperature: (mode === "roast") ? 0.95 : 0.7,
   });
 
   const out = resp?.choices?.[0]?.message?.content?.trim();
@@ -413,12 +422,17 @@ async function searchMusic(query) {
   };
 }
 
-/* ----------------- MENU LINES ----------------- */
-function menuLines() {
+/* ----------------- MENU ----------------- */
+function menuLines(m) {
   const p = SAFE_PREFIX();
+  const st = sessionState(m);
   return [
-    `${p}crysnova menu`,
-    `${p}crysnova setup`,
+    `SESSION: ${st.on ? "ON" : "OFF"} • MODE: ${st.mode.toUpperCase()}`,
+    `${p}crysnova on`,
+    `${p}crysnova off`,
+    `${p}crysnova mode tag`,
+    `${p}crysnova mode all`,
+    `${p}crysnova status`,
     "",
     "AI MODES",
     `${p}crysnova chat <msg>`,
@@ -426,12 +440,12 @@ function menuLines() {
     `${p}crysnova writer <msg>`,
     `${p}crysnova coder <msg>`,
     `${p}crysnova translate <text>`,
-    `${p}crysnova summarize (reply)`,
+    `${p}crysnova summarize   (reply)`,
     "",
     "FUN",
     `${p}crysnova roast`,
     `${p}crysnova roast @user`,
-    `${p}crysnova lastroast (reply)`,
+    `${p}crysnova lastroast   (reply)`,
     `${p}crysnova roastlevel <soft|medium|savage>`,
     "",
     "UTILS",
@@ -441,75 +455,51 @@ function menuLines() {
     "",
     "MEMORY",
     `${p}crysnova mem`,
-    `${p}crysnova memclear`,
-    "",
-    "AUTO REPLY (chat-wide)",
-    `${p}crysnovaon`,
-    `${p}crysnovaoff`,
-    `${p}crysnovastatus`
+    `${p}crysnova memclear`
   ];
 }
 
 async function sendMenu(m) {
-  const img = await makeMenuCard("CRYSNOVA AI", menuLines(), 900);
+  const img = await makeMenuCard("CRYSNOVA AI", menuLines(m), 900);
   if (img) return sendImage(m, img, "");
-  return sendText(m, "CRYSNOVA AI\n\n" + menuLines().join("\n"));
+  return sendText(m, "CRYSNOVA AI\n\n" + menuLines(m).join("\n"));
 }
 
+/* ----------------- ROAST ----------------- */
 function roastLevelOf(m) {
   const p = getPrefs(m);
   return (p.roastlevel || "medium").toLowerCase();
 }
 function setRoastLevel(m, lvl) {
   lvl = String(lvl || "").toLowerCase();
-  if (!["soft", "medium", "savage"].includes(lvl)) return null;
+  if (!["soft","medium","savage"].includes(lvl)) return null;
   setPrefs(m, { roastlevel: lvl });
   return lvl;
 }
+
 async function doRoast(m, targetLabel) {
   const lvl = roastLevelOf(m);
   const instruction =
-    lvl === "soft"
-      ? "Keep it light, friendly, short."
-      : lvl === "savage"
-      ? "Be very witty and sharp, but still no slurs/threats/family curses."
-      : "Be witty, street-smart, not too harsh.";
-  const text = await aiReply(m, `Generate ONE short Nigerian-style witty roast for: ${targetLabel}. ${instruction}`, "roast");
+    lvl === "soft" ? "Keep it light, friendly, short." :
+    lvl === "savage" ? "Be very witty and sharp, but still no slurs/threats/family curses." :
+    "Be witty, street-smart, not too harsh.";
+
+  const text = await aiReply(
+    m,
+    `Generate ONE short Nigerian-style witty roast for: ${targetLabel}. ${instruction}`,
+    "roast"
+  );
   return text.replace(/\s+/g, " ").trim();
 }
-/* ----------------- AUTO-REPLY TOGGLE COMMANDS ----------------- */
-kord(
-  { cmd: "crysnovaon|cryson", desc: "Turn Crysnova auto-reply ON (this chat)", fromMe: wtype, type: "tools", react: "✅" },
-  async (m) => {
-    if (!isAllowed(m)) return;
-    setChatSession(m, { autoon: true });
-    return sendText(m, "CRYSNOVA Auto-Reply: ON (this chat)");
-  }
-);
 
-kord(
-  { cmd: "crysnovaoff|crysoff", desc: "Turn Crysnova auto-reply OFF (this chat)", fromMe: wtype, type: "tools", react: "🛑" },
-  async (m) => {
-    if (!isAllowed(m)) return;
-    setChatSession(m, { autoon: false });
-    return sendText(m, "CRYSNOVA Auto-Reply: OFF (this chat)");
-  }
-);
+/* [PART 2 END] */
+/* [CRYSNOVA AI v2 — PART 3 / 3] */
 
-kord(
-  { cmd: "crysnovastatus|crysstatus", desc: "Check Crysnova auto-reply status", fromMe: wtype, type: "tools", react: "ℹ️" },
-  async (m) => {
-    if (!isAllowed(m)) return;
-    const s = getChatSession(m);
-    return sendText(m, `CRYSNOVA Auto-Reply: ${s.autoon ? "ON" : "OFF"} (this chat)`);
-  }
-);
-
-/* ----------------- MAIN COMMAND ROUTER ----------------- */
+/* ----------------- MAIN COMMAND ----------------- */
 kord(
   {
     cmd: "crysnova|crys",
-    desc: "Crysnova AI (premium assistant)",
+    desc: "Crysnova AI (premium assistant + session auto-reply)",
     fromMe: wtype,
     type: "tools",
     react: "💎",
@@ -522,6 +512,28 @@ kord(
       const rest = args.slice(1).join(" ").trim();
       const p = SAFE_PREFIX();
 
+      // SESSION CONTROLS
+      if (sub === "on") {
+        if (!isAllowed(m)) return;
+        setSession(m, true);
+        return sendText(m, `Session ON. Mode: ${sessionState(m).mode.toUpperCase()}`);
+      }
+      if (sub === "off") {
+        if (!isAllowed(m)) return;
+        setSession(m, false);
+        return sendText(m, "Session OFF.");
+      }
+      if (sub === "mode") {
+        if (!isAllowed(m)) return;
+        const md = setMode(m, rest);
+        if (!md) return sendText(m, `Use: ${p}crysnova mode tag  OR  ${p}crysnova mode all`);
+        return sendText(m, `Mode set: ${md.toUpperCase()}`);
+      }
+      if (sub === "status") {
+        const st = sessionState(m);
+        return sendText(m, `Session: ${st.on ? "ON" : "OFF"}\nMode: ${st.mode.toUpperCase()}`);
+      }
+
       if (sub === "menu" || sub === "help") return sendMenu(m);
 
       if (sub === "setup") {
@@ -529,15 +541,13 @@ kord(
         const okW = (process.env.OPENWEATHER_API_KEY || "").trim() ? "✅" : "❌";
         return sendText(
           m,
-          `CRYSNOVA SETUP\n` +
+          `SETUP\n` +
           `AI Key: ${okAI}\n` +
           `Weather Key: ${okW}\n` +
           `Model: ${MODEL}\n` +
           `Memory: ${memCap()} turns\n` +
           `Cooldown: ${cdSec()}s\n` +
-          `AutoReply Cooldown: ${getVar("CRYS_AUTOREPLY_COOLDOWN", "2")}s\n` +
-          `Theme: ${(process.env.CRYS_THEME || "neon")}\n\n` +
-          `Try: ${p}crysnova menu`
+          `Theme: ${(process.env.CRYS_THEME || "neon")}`
         );
       }
 
@@ -601,7 +611,7 @@ kord(
         if (m?.mentionedJid?.length) {
           const user = m.mentionedJid[0];
           const roast = await doRoast(m, `@${user.split("@")[0]}`);
-          return sendText(m, withMentions(roast, [user]));
+          return sendText(m, withMentions(`${roast}`, [user]));
         }
         const roast = await doRoast(m, "me");
         return sendText(m, roast);
@@ -611,11 +621,11 @@ kord(
         if (!q) return sendText(m, "Reply to someone’s message, then use: crysnova lastroast");
         const user = q.sender;
         const roast = await doRoast(m, `@${String(user || "").split("@")[0] || "user"}`);
-        return sendText(m, withMentions(roast, user ? [user] : []));
+        return sendText(m, withMentions(`${roast}`, user ? [user] : []));
       }
 
       // AI MODES
-      const modeMap = new Set(["chat", "coach", "writer", "coder", "translate"]);
+      const modeMap = new Set(["chat","coach","writer","coder","translate"]);
       if (modeMap.has(sub)) {
         if (!rest) return sendText(m, `Use: ${p}crysnova ${sub} <message>`);
         const out = await aiReply(m, rest, sub);
@@ -629,43 +639,56 @@ kord(
   }
 );
 
-/* ----------------- AUTO-REPLY LISTENER (FIXED: REPLIES TO EVERYONE) ----------------- */
+/* ----------------- AUTO-REPLY LISTENER -----------------
+   When Session is ON:
+   - Mode TAG: only reply when you/bot are mentioned
+   - Mode ALL: reply to everyone
+   Skips commands (prefix) to avoid replying to bot commands.
+-------------------------------------------------------- */
 kord({ on: "all" }, async (m, textArg) => {
   try {
-    if (m?.isBot || m?.isBaileys) return;
+    // Must exist
+    if (!m) return;
 
-    const ses = getChatSession(m);
-    if (!ses.autoon) return;
+    // Ignore own outgoing messages to avoid loops
+    if (m?.fromMe) return;
 
-    const raw =
-      (typeof textArg === "string" ? textArg : "") ||
-      m?.message?.conversation ||
-      m?.message?.extendedTextMessage?.text ||
-      m?.text ||
-      m?.body ||
-      "";
+    const st = sessionState(m);
+    if (!st.on) return;
 
-    const msg = String(raw || "").trim();
-    if (!msg) return;
+    // Only reply in groups/DMs where session enabled (per chat saved)
+    // If TAG mode: require mention
+    if (st.mode === "tag" && !isTaggedForSession(m)) return;
 
-    const pfx = SAFE_PREFIX();
-    if (msg.startsWith(pfx)) return;
+    const txt = getTextFromAny(m, textArg).trim();
+    if (!txt) return;
 
-    // avoid replying to crysnova commands typed without prefix (rare)
-    if (/^(crysnova|crys)\b/i.test(msg)) return;
+    // Skip if it looks like a command (starts with prefix)
+    const p = SAFE_PREFIX();
+    if (txt.startsWith(p)) return;
 
-    const cd = Math.max(0, Math.min(10, parseInt(getVar("CRYS_AUTOREPLY_COOLDOWN", "2"), 10) || 2));
-    const key = "AUTO::" + chatKey(m);
-    const now = Date.now();
-    const last = COOLDOWN.get(key) || 0;
-    if (now - last < cd * 1000) return;
-    COOLDOWN.set(key, now);
+    // Cooldown per chat (prevent spam)
+    const cdKey = "auto::" + getChatId(m);
+    const left = checkCooldownKey(cdKey);
+    if (left) return;
 
-    const out = await aiReply(m, msg, "chat");
-    return await sendText(m, out);
+    // Build a short prompt with context
+    const name = m?.pushName ? String(m.pushName).trim() : "user";
+    const mode = "auto";
+    const prompt =
+      `Reply to this WhatsApp message as CRYSNOVA AI.\n` +
+      `Sender name: ${name}\n` +
+      `Message: ${txt}\n\n` +
+      `Reply short, helpful, and natural.`;
+
+    const out = await aiReply(m, prompt, mode);
+    return sendText(m, out);
   } catch {
+    // silent fail (don’t spam errors during auto)
     return;
   }
 });
 
 module.exports = {};
+
+/* [PART 3 END] */
