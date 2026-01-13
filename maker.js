@@ -1,345 +1,299 @@
 /**
- * MAKER GOD 2.0 — Premium Plugin Maker (Safe, No Spawn)
+ * Maker God 2.0 — Beginner-friendly plugin generator (SAFE)
  * File: /home/container/cmds/maker.js
  *
- * Commands:
- *  - maker start <name>         => begin creating plugin (name = filename without .js)
- *  - maker cmd <cmds>           => set command(s), e.g: "png" or "png|image|toimg"
- *  - maker desc <text>          => set description
- *  - maker type <tools|core|ai|fun|image|etc> => set plugin type
- *  - maker react <emoji>        => set reaction emoji
- *  - maker fromme <true|false>  => set fromMe / wtype
- *  - maker deps <a,b,c>         => list npm deps (just stored + shown)
+ * Commands (simple):
+ *  - maker start
+ *  - maker idea <plain english>
+ *  - maker cmd <name>
+ *  - maker type <tools|core|image|fun|...>
+ *  - maker done
  *
- *  - maker logic                => enter logic capture mode (reply lines, or send lines)
- *  - maker add                  => add replied text OR next message to logic
- *  - maker end                  => stop capture mode
+ * Advanced:
+ *  - maker desc <...>
+ *  - maker react <emoji>
+ *  - maker fromme <true|false>
+ *  - maker deps <a,b,c>
+ *  - maker template <ping|text|api_get|api_post|png_stub>
+ *  - maker preview
+ *  - maker cancel
  *
- *  - maker preview              => show generated plugin
- *  - maker save                 => write /cmds/<name>.js
- *  - maker cancel               => clear session
- *  - maker panic                => clear ALL sessions (emergency)
- *
- * Notes:
- *  - This does NOT use spawn/exec. No shell.
- *  - If you need to install deps, it will show: npm i ...
+ * Safety:
+ *  - Blocks dangerous keywords in user-injected code.
+ *  - Syntax-checks generated plugin before saving (vm.Script).
  */
 
 const fs = require("fs");
 const path = require("path");
-
+const vm = require("vm");
 const { kord, wtype } = require("../core");
 
-// ---------- SESSION STORE ----------
-const SESS = new Map(); // key => session
-const TTL_MS = 20 * 60 * 1000;
+const CMD_DIR = "/home/container/cmds";
+const SESS = new Map(); // per chat+sender
 
-function now() {
-  return Date.now();
-}
-function key(m) {
+function skey(m) {
   const chat = m?.chat || m?.key?.remoteJid || "chat";
   const sender = m?.sender || m?.key?.participant || "sender";
   return `${chat}::${sender}`;
 }
-function getSess(m) {
-  const k = key(m);
-  const s = SESS.get(k);
-  if (!s) return null;
-  if (s.ts && now() - s.ts > TTL_MS) {
-    SESS.delete(k);
-    return null;
-  }
+
+function cleanCmd(s) {
+  s = String(s || "").trim().toLowerCase();
+  s = s.replace(/[^a-z0-9_]/g, "");
   return s;
 }
-function setSess(m, patch) {
-  const k = key(m);
-  const prev = SESS.get(k) || {};
-  const next = { ...prev, ...patch, ts: now() };
-  SESS.set(k, next);
-  return next;
-}
-function clearSess(m) {
-  SESS.delete(key(m));
-}
-function panicAll() {
-  SESS.clear();
+
+function pickEmoji(type) {
+  const t = String(type || "").toLowerCase();
+  if (t.includes("image")) return "🖼️";
+  if (t.includes("core")) return "🧠";
+  if (t.includes("fun")) return "🎭";
+  if (t.includes("tools")) return "🛠️";
+  return "✨";
 }
 
-// ---------- TEXT HELPERS ----------
-function textOf(m, arg) {
-  return String(
-    (typeof arg === "string" ? arg : "") ||
-      m?.text ||
-      m?.body ||
-      m?.message?.conversation ||
-      m?.message?.extendedTextMessage?.text ||
-      ""
-  ).trim();
+function safeDefaults(sess) {
+  if (!sess.desc) sess.desc = sess.idea ? String(sess.idea).slice(0, 40) : "New plugin";
+  if (!sess.type) sess.type = "tools";
+  if (!sess.react) sess.react = pickEmoji(sess.type);
+  if (sess.fromMe === undefined) sess.fromMe = false; // beginner-friendly default
+  if (!sess.template) sess.template = autoTemplate(sess.idea);
+  if (!sess.deps) sess.deps = autoDeps(sess.template);
 }
 
-function sanitizeName(n) {
-  n = String(n || "").trim().toLowerCase();
-  n = n.replace(/\.js$/i, "");
-  n = n.replace(/[^a-z0-9_\-]/g, "");
-  if (!n) return "";
-  return n;
+function autoTemplate(idea = "") {
+  const x = String(idea).toLowerCase();
+  if (x.includes("ping")) return "ping";
+  if (x.includes("api") || x.includes("fetch") || x.includes("http")) return "api_get";
+  if (x.includes("png") || x.includes("convert") || x.includes("image to png")) return "png_stub";
+  if (x.includes("reply") || x.includes("text")) return "text";
+  return "text";
 }
 
-function escapeBackticks(s) {
-  return String(s || "").replace(/```/g, "``\\`");
+function autoDeps(template) {
+  if (template === "png_stub") return "sharp";
+  if (template === "api_get" || template === "api_post") return "axios";
+  return "";
 }
 
-function safeEmoji(e) {
-  e = String(e || "").trim();
-  if (!e) return "";
-  if (e.length > 8) return e.slice(0, 8);
-  return e;
+// Very important: block obvious dangerous stuff if you ever add "custom logic" mode later
+function looksDangerous(code) {
+  const bad = [
+    "child_process",
+    "exec(",
+    "spawn(",
+    "fork(",
+    "eval(",
+    "Function(",
+    "process.exit",
+    "rm -rf",
+    "fs.rmdir",
+    "fs.unlink",
+    "fs.writeFileSync('/",
+    "fs.writeFileSync(\"/",
+  ];
+  const s = String(code || "").toLowerCase();
+  return bad.some((k) => s.includes(k));
 }
 
-function parseBool(x) {
-  const v = String(x || "").trim().toLowerCase();
-  if (["true", "yes", "1", "on"].includes(v)) return true;
-  if (["false", "no", "0", "off"].includes(v)) return false;
-  return null;
-}
+// Templates: safe, pro, always try/catch, minimal assumptions
+function renderTemplate(sess) {
+  const cmd = sess.cmd;
+  const desc = sess.desc;
+  const type = sess.type;
+  const react = sess.react;
+  const fromMe = sess.fromMe ? "wtype" : "false";
+  const deps = sess.deps ? `// deps: ${sess.deps}\n` : "";
 
-function normalizeDeps(s) {
-  const raw = String(s || "")
-    .split(/[, ]+/)
-    .map((x) => x.trim())
-    .filter(Boolean);
+  let body = "";
 
-  // Keep only safe package names
-  const deps = raw.filter((d) => /^[a-z0-9@\/\-_\.]+$/i.test(d));
-  return Array.from(new Set(deps)).slice(0, 12);
-}
+  if (sess.template === "ping") {
+    body = `
+      const ms = Date.now();
+      const msg = "✅ Pong! " + (Date.now() - ms) + "ms";
+      return m.reply(msg);
+    `.trim();
+  } else if (sess.template === "text") {
+    body = `
+      const text = String(arg || "").trim();
+      if (!text) return m.reply("❌ Use: ${cmd} <text>");
+      return m.reply("✅ " + text);
+    `.trim();
+  } else if (sess.template === "api_get") {
+    body = `
+      const axios = require("axios");
+      const q = String(arg || "").trim();
+      if (!q) return m.reply("❌ Use: ${cmd} <query>");
+      // Example endpoint — replace with your own API
+      const url = "https://httpbin.org/get?query=" + encodeURIComponent(q);
+      const r = await axios.get(url, { timeout: 30000 });
+      return m.reply("✅ API OK\\n" + JSON.stringify(r.data, null, 2).slice(0, 3500));
+    `.trim();
+  } else if (sess.template === "api_post") {
+    body = `
+      const axios = require("axios");
+      const text = String(arg || "").trim();
+      if (!text) return m.reply("❌ Use: ${cmd} <text>");
+      const r = await axios.post("https://httpbin.org/post", { text }, { timeout: 30000 });
+      return m.reply("✅ POST OK\\n" + JSON.stringify(r.data, null, 2).slice(0, 3500));
+    `.trim();
+  } else if (sess.template === "png_stub") {
+    body = `
+      const sharp = require("sharp");
 
-// ---------- GENERATOR ----------
-function buildPlugin(sess) {
-  const name = sess.name;
-  const cmd = sess.cmd || name;
-  const desc = sess.desc || "Custom plugin";
-  const type = sess.type || "tools";
-  const react = sess.react || "✨";
-  const fromMe = sess.fromMe === false ? "false" : "wtype"; // default to wtype
-  const deps = sess.deps || [];
-  const logicLines = sess.logic || [];
+      // Must reply to an image for conversion
+      const quoted = m?.quoted || m?.msg?.quoted;
+      if (!quoted) return m.reply("❌ Reply to an image.");
 
-  const header =
-`/**
- * Plugin: ${name}.js
- * Generated by MAKER GOD 2.0
- * cmd: ${cmd}
- * deps: ${deps.length ? deps.join(", ") : "none"}
- */`;
+      let media = null;
+      try { if (typeof m.download === "function") media = await m.download(); } catch {}
+      try { if (!media && quoted?.download) media = await quoted.download(); } catch {}
 
-  const depsComment = deps.length
-    ? `// deps: ${deps.join(", ")}\n// install: npm i ${deps.join(" ")}\n`
-    : `// deps: none\n`;
+      if (!media) return m.reply("❌ Failed to download image.");
+      const png = await sharp(media).png().toBuffer();
 
-  const logic =
-logicLines.length
-  ? logicLines.join("\n")
-  : `// TODO: write your logic here\nreturn m.reply("✅ ${cmd} works!");`;
+      if (m?.client?.sendMessage) {
+        return await m.client.sendMessage(m.chat, { image: png, caption: "✅ PNG ready" }, { quoted: m });
+      }
+      return m.reply("✅ PNG ready (sendMessage not available).");
+    `.trim();
+  } else {
+    body = `return m.reply("✅ ${cmd} ready");`;
+  }
 
-  return `${header}
-
-${depsComment}
-const { kord, wtype } = require("../core");
+  const code = `
+${deps}const { kord, wtype } = require("../core");
 
 kord(
-  { cmd: "${cmd}", desc: "${escapeBackticks(desc)}", fromMe: ${fromMe}, type: "${type}", react: "${escapeBackticks(react)}" },
+  { cmd: "${cmd}", desc: "${escapeStr(desc)}", fromMe: ${fromMe}, type: "${escapeStr(type)}", react: "${escapeStr(react)}" },
   async (m, arg) => {
     try {
-${indent(logic, 6)}
+      ${body}
     } catch (e) {
       return m.reply("❌ ${cmd} error: " + (e?.message || e));
     }
   }
 );
-`;
+`.trim() + "\n";
+
+  return code;
 }
 
-function indent(s, spaces) {
-  const pad = " ".repeat(spaces);
-  return String(s || "")
-    .split("\n")
-    .map((l) => (l.trim().length ? pad + l : ""))
-    .join("\n");
+function escapeStr(s) {
+  return String(s || "").replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/"/g, '\\"');
 }
 
-// ---------- MAIN COMMAND ----------
+function syntaxCheck(jsCode) {
+  // Parse only; does not run code
+  new vm.Script(jsCode, { filename: "plugin.js" });
+  return true;
+}
+
+function helpText(sess) {
+  safeDefaults(sess);
+  return (
+    "🧩 *Maker God 2.0*\n" +
+    "Send these (beginner mode):\n" +
+    "• maker idea <what you want>\n" +
+    "• maker cmd <name>\n" +
+    "• maker type <tools|core|image|fun>\n" +
+    "• maker done\n\n" +
+    "Optional:\n" +
+    "• maker desc <...>\n" +
+    "• maker react <emoji>\n" +
+    "• maker fromme <true|false>\n" +
+    "• maker deps <a,b>\n" +
+    "• maker template <ping|text|api_get|api_post|png_stub>\n\n" +
+    `Current:\n` +
+    `• cmd: ${sess.cmd || "—"}\n` +
+    `• desc: ${sess.desc || "—"}\n` +
+    `• type: ${sess.type || "—"}\n` +
+    `• react: ${sess.react || "—"}\n` +
+    `• fromMe: ${sess.fromMe === undefined ? "—" : String(sess.fromMe)}\n` +
+    `• deps: ${sess.deps || "—"}\n` +
+    `• template: ${sess.template || "—"}\n`
+  );
+}
+
 kord(
-  { cmd: "maker", desc: "Plugin Maker God 2.0", fromMe: wtype, type: "core", react: "🧩" },
+  { cmd: "maker", desc: "Maker God 2.0 (plugin generator)", fromMe: wtype, type: "tools", react: "🧩" },
   async (m, arg) => {
-    const input = textOf(m, arg);
-    const [sub, ...rest] = input.split(" ");
-    const value = rest.join(" ").trim();
+    const k = skey(m);
+    const txt = String(arg || "").trim();
 
-    if (!sub) {
-      return m.reply(
-        "🧩 *MAKER GOD 2.0*\n" +
-          "Commands:\n" +
-          "• maker start <name>\n" +
-          "• maker cmd <cmd|a|b>\n" +
-          "• maker desc <text>\n" +
-          "• maker type <tools|core|...>\n" +
-          "• maker react <emoji>\n" +
-          "• maker fromme <true|false>\n" +
-          "• maker deps <axios,canvas>\n" +
-          "• maker logic / maker add / maker end\n" +
-          "• maker preview / maker save\n" +
-          "• maker cancel / maker panic"
-      );
+    if (!txt || txt === "help") {
+      const sess = SESS.get(k) || {};
+      return m.reply(helpText(sess));
     }
 
-    // PANIC
-    if (sub === "panic") {
-      panicAll();
-      return m.reply("✅ Maker sessions cleared (panic).");
-    }
+    const [sub, ...rest] = txt.split(/\s+/);
+    const val = rest.join(" ").trim();
 
-    // START
+    // start
     if (sub === "start") {
-      const n = sanitizeName(value);
-      if (!n) return m.reply("❌ Use: maker start <name> (letters/numbers/_/- only)");
-      setSess(m, {
-        name: n,
-        cmd: n,
-        desc: "",
-        type: "tools",
-        react: "✨",
-        fromMe: true,
-        deps: [],
-        logic: [],
-        capture: false,
-      });
-
-      return m.reply(
-        "🧩 *Started: " + n + "*\n" +
-          "Now send:\n" +
-          "• maker desc <...>\n" +
-          "• maker cmd <...>\n" +
-          "• maker type <...>\n" +
-          "• maker react <...>\n" +
-          "• maker fromme <true|false>\n" +
-          "• maker deps <a,b>\n\n" +
-          "Then:\n" +
-          "• maker logic (start capture)\n" +
-          "• maker add (append replied text)\n" +
-          "• maker end\n\n" +
-          "Finish:\n" +
-          "• maker preview\n" +
-          "• maker save"
-      );
+      SESS.set(k, { started: Date.now() });
+      return m.reply(helpText(SESS.get(k)));
     }
 
-    const sess = getSess(m);
-    if (!sess) {
-      return m.reply("❌ No active maker session. Use: maker start <name>");
-    }
-
-    // SETTERS
-    if (sub === "cmd") {
-      const v = value || sess.name;
-      setSess(m, { cmd: v });
-      return m.reply("✅ cmd set: " + v);
-    }
-
-    if (sub === "desc") {
-      setSess(m, { desc: value });
-      return m.reply("✅ desc set.");
-    }
-
-    if (sub === "type") {
-      const v = value || "tools";
-      setSess(m, { type: v });
-      return m.reply("✅ type set: " + v);
-    }
-
-    if (sub === "react") {
-      const v = safeEmoji(value) || "✨";
-      setSess(m, { react: v });
-      return m.reply("✅ react set: " + v);
-    }
-
-    if (sub === "fromme") {
-      const b = parseBool(value);
-      if (b === null) return m.reply("❌ Use: maker fromme true OR maker fromme false");
-      setSess(m, { fromMe: b });
-      return m.reply("✅ fromMe set: " + b);
-    }
-
-    if (sub === "deps") {
-      const deps = normalizeDeps(value);
-      setSess(m, { deps });
-      return m.reply(
-        "✅ deps set: " + (deps.length ? deps.join(", ") : "none") +
-          (deps.length ? `\n📦 Install manually: npm i ${deps.join(" ")}` : "")
-      );
-    }
-
-    // LOGIC CAPTURE
-    if (sub === "logic") {
-      setSess(m, { capture: true });
-      return m.reply("🧠 Logic capture ON.\nSend lines, or reply a message then: maker add\nStop with: maker end");
-    }
-
-    if (sub === "end") {
-      setSess(m, { capture: false });
-      return m.reply("✅ Logic capture OFF.");
-    }
-
-    if (sub === "add") {
-      // take replied text if exists, else take current message after "maker add"
-      let addText = "";
-      if (m?.quoted && (m?.quoted?.text || m?.quoted?.body)) {
-        addText = String(m.quoted.text || m.quoted.body || "").trim();
-      } else {
-        addText = value;
-      }
-      if (!addText) return m.reply("❌ Reply a text message OR use: maker add <line>");
-      const lines = addText.split("\n").map((x) => x.replace(/\r/g, ""));
-      setSess(m, { logic: [...(sess.logic || []), ...lines] });
-      return m.reply("✅ Added " + lines.length + " line(s) to logic.");
-    }
-
-    // PREVIEW
-    if (sub === "preview") {
-      const out = buildPlugin(getSess(m));
-      return m.reply("```js\n" + escapeBackticks(out).slice(0, 6500) + "\n```");
-    }
-
-    // SAVE
-    if (sub === "save") {
-      const out = buildPlugin(getSess(m));
-      const file = path.join("/home/container/cmds", `${sess.name}.js`);
-      fs.writeFileSync(file, out, "utf8");
-      setSess(m, { capture: false });
-
-      return m.reply(
-        "✅ Saved plugin:\n" +
-          `• File: cmds/${sess.name}.js\n` +
-          `• cmd: ${sess.cmd}\n` +
-          (sess.deps?.length ? `• deps: ${sess.deps.join(", ")}\n• install: npm i ${sess.deps.join(" ")}` : "• deps: none")
-      );
-    }
-
-    // CANCEL
+    // cancel
     if (sub === "cancel") {
-      clearSess(m);
+      SESS.delete(k);
       return m.reply("✅ Maker session cleared.");
     }
 
-    // default: if capture mode, treat as logic line
-    if (sess.capture) {
-      const line = input; // full message after "maker ..."
-      // But if user typed "maker something" we shouldn't add that.
-      // So if message starts with maker, ignore.
-      return m.reply("⚠️ Use: maker add (or maker add <line>) while capture is ON.");
+    const sess = SESS.get(k);
+    if (!sess) return m.reply("❌ Start first: maker start");
+
+    if (sub === "idea") sess.idea = val;
+    else if (sub === "cmd") sess.cmd = cleanCmd(val);
+    else if (sub === "desc") sess.desc = val;
+    else if (sub === "type") sess.type = val || "tools";
+    else if (sub === "react") sess.react = val || "✨";
+    else if (sub === "fromme") sess.fromMe = (val === "true" || val === "1" || val === "yes");
+    else if (sub === "deps") sess.deps = val.replace(/\s+/g, "");
+    else if (sub === "template") sess.template = val;
+    else if (sub === "preview") {
+      safeDefaults(sess);
+      if (!sess.cmd) return m.reply("❌ Set cmd first: maker cmd <name>");
+      const code = renderTemplate(sess);
+      return m.reply("🧾 *Preview*\n\n```js\n" + code.slice(0, 3800) + "\n```");
+    }
+    else if (sub === "done" || sub === "save") {
+      safeDefaults(sess);
+      if (!sess.cmd) return m.reply("❌ Missing: cmd. Use: maker cmd <name>");
+
+      const outFile = path.join(CMD_DIR, `${sess.cmd}.js`);
+      const code = renderTemplate(sess);
+
+      if (looksDangerous(code)) {
+        return m.reply("❌ Blocked: generated code contains dangerous patterns.");
+      }
+
+      try {
+        syntaxCheck(code);
+      } catch (e) {
+        return m.reply("❌ Syntax check failed:\n" + (e?.message || e));
+      }
+
+      fs.writeFileSync(outFile, code, "utf8");
+
+      const depLine = sess.deps
+        ? `\n📦 Install deps:\n\`npm i ${sess.deps.split(",").filter(Boolean).join(" ")}\``
+        : "";
+
+      return m.reply(
+        `✅ Plugin saved: /cmds/${sess.cmd}.js\n` +
+        `⚙️ Command: ${sess.cmd}\n` +
+        `🧩 Template: ${sess.template}\n` +
+        depLine +
+        `\n\nRestart your bot to load it.`
+      );
+    }
+    else {
+      return m.reply("❌ Unknown maker subcommand. Send: maker help");
     }
 
-    return m.reply("❌ Unknown maker command. Use: maker");
+    SESS.set(k, sess);
+    return m.reply(helpText(sess));
   }
 );
