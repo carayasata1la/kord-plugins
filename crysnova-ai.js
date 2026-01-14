@@ -1,37 +1,5 @@
-/* [CRYSNOVA AI v3 — PART 1 / 3] */
-
-/**
- * CRYSNOVA AI v3 — Premium Assistant + Auto Reply + Provider Switch
- *
- * Commands:
- *  - crysnova menu | help | setup
- *  - crysnova provider [openai|openrouter|groq|gemini|hf]
- *  - crysnova model <modelName>
- *  - crysnova useopenai | useopenrouter | usegroq | usegemini
- *
- *  - crysnova on | off
- *  - crysnova mode tag | mode all
- *  - crysnova status
- *
- *  - crysnova chat <msg>
- *  - crysnova coach <msg>
- *  - crysnova writer <msg>
- *  - crysnova coder <msg>
- *  - crysnova translate <text>
- *  - crysnova summarize (reply)
- *
- *  - crysnova roast
- *  - crysnova roast @user
- *  - crysnova lastroast (reply)
- *  - crysnova roastlevel <soft|medium|savage>
- *
- *  - crysnova weather <city>
- *  - crysnova setcity <city>
- *  - crysnova music <query>
- *
- *  - crysnova mem
- *  - crysnova memclear
- *
+/* [CRYSNOVA AI ULTRA — PART 1 / 3]
+ * File: /home/container/cmds/crysnova.js
  * Deps: axios, openai (canvas optional)
  */
 
@@ -48,7 +16,25 @@ const { kord, wtype, config, prefix } = require("../core");
 let Canvas = null;
 try { Canvas = require("canvas"); } catch {}
 
-/* ----------------- SAFE CONFIG ----------------- */
+const ROOT = "/home/container";
+const DATA_DIR = path.join(ROOT, "cmds", ".crysnova_ultra");
+const MEM_FILE = path.join(DATA_DIR, "memory.json");
+const PREF_FILE = path.join(DATA_DIR, "prefs.json");
+
+function ensureDirs() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(MEM_FILE)) fs.writeFileSync(MEM_FILE, JSON.stringify({ users: {} }, null, 2));
+  if (!fs.existsSync(PREF_FILE)) fs.writeFileSync(PREF_FILE, JSON.stringify({ users: {}, chats: {} }, null, 2));
+}
+function readJSON(file, fallback) {
+  ensureDirs();
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; }
+}
+function writeJSON(file, obj) {
+  ensureDirs();
+  fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf8");
+}
+
 function getCfgAny() {
   try { if (typeof config === "function") return config() || {}; } catch {}
   try { return config || {}; } catch { return {}; }
@@ -75,6 +61,7 @@ function getVar(name, fallback = "") {
   }
   return fallback;
 }
+
 function getSenderId(m) {
   return m?.sender || m?.key?.participant || m?.participant || m?.key?.remoteJid || "unknown";
 }
@@ -90,11 +77,12 @@ function isAllowed(m) {
   const sudoRaw = cfg?.SUDO || cfg?.SUDO_USERS || cfg?.SUDOS;
   const sender = getSenderId(m);
   if (sudoRaw && sender) {
-    const list = Array.isArray(sudoRaw) ? sudoRaw : String(sudoRaw).split(",").map(x=>x.trim()).filter(Boolean);
+    const list = Array.isArray(sudoRaw) ? sudoRaw : String(sudoRaw).split(",").map(x => x.trim()).filter(Boolean);
     if (list.includes(sender)) return true;
   }
   return false;
 }
+
 function getTextFromAny(m, textArg) {
   const t =
     (typeof textArg === "string" ? textArg : "") ||
@@ -106,15 +94,38 @@ function getTextFromAny(m, textArg) {
   return String(t || "");
 }
 
-/* ----------------- SEND HELPERS ----------------- */
+/* ---------- robust arg parsing (works across KORD variants) ---------- */
+function extractAfterCommand(m, cmdNames) {
+  const body = getTextFromAny(m, "").trim();
+  if (!body) return "";
+  const p = SAFE_PREFIX();
+  const b = body.startsWith(p) ? body.slice(p.length).trim() : body;
+  const low = b.toLowerCase();
+  const names = String(cmdNames || "").split("|").map(s => s.trim().toLowerCase()).filter(Boolean);
+  for (const n of names) {
+    if (low === n) return "";
+    if (low.startsWith(n + " ")) return b.slice(n.length).trim();
+  }
+  return "";
+}
+function parseSubArgs(m, textArg, cmdNames) {
+  let raw = String(textArg || "").trim();
+  if (!raw) raw = extractAfterCommand(m, cmdNames);
+  const parts = raw.split(/\s+/).filter(Boolean);
+  const sub = (parts.shift() || "menu").toLowerCase();
+  const rest = parts.join(" ").trim();
+  return { sub, rest, parts, raw };
+}
+
+/* ---------- sending helpers ---------- */
 async function sendText(m, txt, opt = {}) {
   try { if (typeof m.send === "function") return await m.send(txt, opt); } catch {}
   try {
     if (m?.client?.sendMessage) {
-      return await m.client.sendMessage(getChatId(m), { text: txt, ...opt }, { quoted: m });
+      return await m.client.sendMessage(getChatId(m), { text: String(txt), ...opt }, { quoted: m });
     }
   } catch {}
-  try { if (typeof m.reply === "function") return await m.reply(txt); } catch {}
+  try { if (typeof m.reply === "function") return await m.reply(String(txt)); } catch {}
   return null;
 }
 async function sendImage(m, buf, caption = "", opt = {}) {
@@ -127,58 +138,39 @@ async function sendImage(m, buf, caption = "", opt = {}) {
   return sendText(m, caption || "✅", opt);
 }
 function withMentions(text, jids) {
-  return { text, mentions: Array.isArray(jids) ? jids : [] };
+  return { text: String(text || ""), mentions: Array.isArray(jids) ? jids : [] };
 }
 
-/* ----------------- STORAGE ----------------- */
-const ROOT = "/home/container";
-const DATA_DIR = path.join(ROOT, "cmds", ".crysnova");
-const MEM_FILE = path.join(DATA_DIR, "memory.json");
-const PREF_FILE = path.join(DATA_DIR, "prefs.json");
+/* ---------- prefs + chat prefs ---------- */
+function ukey(m) { return `${getChatId(m)}::${getSenderId(m)}`; }
+function ckey(m) { return `${getChatId(m)}`; }
 
-function ensureDirs() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(MEM_FILE)) fs.writeFileSync(MEM_FILE, JSON.stringify({ users: {} }, null, 2));
-  if (!fs.existsSync(PREF_FILE)) fs.writeFileSync(PREF_FILE, JSON.stringify({ users: {}, chats: {} }, null, 2));
-}
-function readJSON(file, fallback) {
-  ensureDirs();
-  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; }
-}
-function writeJSON(file, obj) {
-  ensureDirs();
-  fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf8");
-}
-function ukey(m) {
-  return `${getChatId(m)}::${getSenderId(m)}`;
-}
-function chatKey(m) {
-  return `${getChatId(m)}`;
-}
-function getPrefs(m) {
+function getUserPrefs(m) {
   const db = readJSON(PREF_FILE, { users: {}, chats: {} });
   return db.users[ukey(m)] || {};
 }
-function setPrefs(m, patch) {
+function setUserPrefs(m, patch) {
   const db = readJSON(PREF_FILE, { users: {}, chats: {} });
   const k = ukey(m);
   db.users[k] = { ...(db.users[k] || {}), ...patch };
   writeJSON(PREF_FILE, db);
   return db.users[k];
 }
-function getChatPrefs(m) {
+function getChatPrefsById(chatId) {
   const db = readJSON(PREF_FILE, { users: {}, chats: {} });
-  return db.chats[chatKey(m)] || {};
+  return db.chats[String(chatId)] || {};
 }
-function setChatPrefs(m, patch) {
+function setChatPrefsById(chatId, patch) {
   const db = readJSON(PREF_FILE, { users: {}, chats: {} });
-  const k = chatKey(m);
+  const k = String(chatId);
   db.chats[k] = { ...(db.chats[k] || {}), ...patch };
   writeJSON(PREF_FILE, db);
   return db.chats[k];
 }
+function getChatPrefs(m) { return getChatPrefsById(ckey(m)); }
+function setChatPrefs(m, patch) { return setChatPrefsById(ckey(m), patch); }
 
-/* ----------------- MEMORY (rolling per-user) ----------------- */
+/* ---------- memory (per user) ---------- */
 function memCap() {
   const v = parseInt(getVar("CRYS_MEM", "24"), 10);
   return Math.max(8, Math.min(80, Number.isFinite(v) ? v : 24));
@@ -205,41 +197,23 @@ function clearMem(m) {
   writeJSON(MEM_FILE, db);
 }
 
-/* ----------------- COOLDOWN (per-chat key) ----------------- */
+/* ---------- cooldown (per chat for auto + per user for manual) ---------- */
 const COOLDOWN = new Map();
 function cdSec() {
-  const v = parseInt(getVar("CRYS_COOLDOWN", "4"), 10);
-  return Math.max(0, Math.min(30, Number.isFinite(v) ? v : 4));
+  const v = parseInt(getVar("CRYS_COOLDOWN", "3"), 10);
+  return Math.max(0, Math.min(30, Number.isFinite(v) ? v : 3));
 }
-function checkCooldownKey(key) {
+function cooldownHit(key) {
   const s = cdSec();
-  if (!s) return null;
+  if (!s) return 0;
   const now = Date.now();
   const last = COOLDOWN.get(key) || 0;
   if (now - last < s * 1000) return Math.ceil((s * 1000 - (now - last)) / 1000);
   COOLDOWN.set(key, now);
-  return null;
+  return 0;
 }
 
-/* ----------------- SESSION + MODE (per chat) ----------------- */
-function sessionState(m) {
-  const c = getChatPrefs(m);
-  return {
-    on: !!c.session_on,
-    mode: (c.session_mode || "tag").toLowerCase(), // tag | all
-  };
-}
-function setSession(m, on) {
-  return setChatPrefs(m, { session_on: !!on });
-}
-function setMode(m, mode) {
-  mode = String(mode || "").toLowerCase();
-  if (!["tag", "all"].includes(mode)) return null;
-  setChatPrefs(m, { session_mode: mode });
-  return mode;
-}
-
-/* ----------------- BOT/OWNER TAG DETECT ----------------- */
+/* ---------- tagging detection ---------- */
 function getBotJid(m) {
   const a = m?.client?.user?.id || m?.client?.user?.jid || m?.user?.id || "";
   if (a && typeof a === "string") return a.includes("@") ? a : `${a}@s.whatsapp.net`;
@@ -257,6 +231,7 @@ function getOwnerJidGuess() {
 function isTaggedForSession(m) {
   const mentioned = Array.isArray(m?.mentionedJid) ? m.mentionedJid : [];
   if (!mentioned.length) return false;
+
   const bot = getBotJid(m);
   const owner = getOwnerJidGuess();
 
@@ -271,242 +246,132 @@ function isTaggedForSession(m) {
   });
 }
 
-/* ----------------- PROVIDERS ----------------- */
-const KEYS = {
-  openai: (process.env.OPENAI_API_KEY || "").trim(),
-  openrouter: (process.env.OPENROUTER_API_KEY || "").trim(),
-  groq: (process.env.GROQ_API_KEY || "").trim(),
-  gemini: (process.env.GEMINI_API_KEY || "").trim(),
-  hf: (process.env.HF_TOKEN || "").trim(),
-};
+/* [PART 1 END] */
+/* [CRYSNOVA AI ULTRA — PART 2 / 3] */
 
-const DEFAULTS = {
-  openai: "gpt-4o-mini",
-  openrouter: "google/gemini-2.0-flash-lite",
-  groq: "llama-3.1-70b-versatile",
-  gemini: "gemini-2.0-flash",
-  hf: "meta-llama/Llama-3.1-8B-Instruct",
-};
+/* ---------- provider + model (per chat) ---------- */
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
+const GROQ_API_KEY = (process.env.GROQ_API_KEY || "").trim();
 
-function getRuntimeProvider(m) {
+const DEF_MODEL_OPENAI = (process.env.CRYS_MODEL_OPENAI || "gpt-4o-mini").trim();
+const DEF_MODEL_GROQ = (process.env.CRYS_MODEL_GROQ || "llama-3.1-70b-versatile").trim();
+
+function providerState(m) {
   const c = getChatPrefs(m);
-  return (c.ai_provider || "").trim().toLowerCase() || "openai";
+  const provider = (c.provider || "openai").toLowerCase(); // openai|groq
+  const modelOpenAI = (c.model_openai || DEF_MODEL_OPENAI).trim();
+  const modelGroq = (c.model_groq || DEF_MODEL_GROQ).trim();
+  return { provider, modelOpenAI, modelGroq };
 }
-function setRuntimeProvider(m, p) {
-  p = String(p || "").trim().toLowerCase();
-  if (!["openai","openrouter","groq","gemini","hf"].includes(p)) return null;
-  setChatPrefs(m, { ai_provider: p, ai_model: DEFAULTS[p] });
+function setProvider(m, p) {
+  p = String(p || "").toLowerCase();
+  if (!["openai","groq"].includes(p)) return null;
+  setChatPrefs(m, { provider: p });
   return p;
 }
-function getRuntimeModel(m) {
-  const c = getChatPrefs(m);
-  const p = getRuntimeProvider(m);
-  return (c.ai_model || "").trim() || DEFAULTS[p];
-}
-function setRuntimeModel(m, model) {
+function setModel(m, provider, model) {
+  provider = String(provider || "").toLowerCase();
   model = String(model || "").trim();
-  if (!model || model.length > 120) return null;
-  setChatPrefs(m, { ai_model: model });
-  return model;
+  if (!model) return null;
+  if (provider === "openai") { setChatPrefs(m, { model_openai: model }); return model; }
+  if (provider === "groq") { setChatPrefs(m, { model_groq: model }); return model; }
+  return null;
 }
 
-function openaiClientFor(provider) {
-  if (!provider) provider = "openai";
-  const key = KEYS[provider] || "";
-  if (!key) return null;
-
-  // OpenAI SDK works with compatible baseURL providers (OpenRouter, Groq, Gemini via OpenAI-compatible endpoints)
-  let baseURL = undefined;
-
-  if (provider === "openrouter") baseURL = "https://openrouter.ai/api/v1";
-  if (provider === "groq") baseURL = "https://api.groq.com/openai/v1";
-  if (provider === "gemini") baseURL = "https://generativelanguage.googleapis.com/v1beta/openai";
-  // hf: not OpenAI-compatible here (we will call HF directly with axios)
-
-  if (provider === "hf") return { provider: "hf" };
-
-  return new OpenAI({ apiKey: key, baseURL });
-}
-
-/* ----------------- CANVAS MENU ----------------- */
-const THEMES = {
-  neon:   { neon:"#27ff9a", dim:"#eafff6", border:"#1ccf7b", panel:"rgba(6,24,15,0.72)" },
-  ice:    { neon:"#7df3ff", dim:"#e8fbff", border:"#3ad7ff", panel:"rgba(6,16,24,0.72)" },
-  purple: { neon:"#c77dff", dim:"#f4eaff", border:"#8a2be2", panel:"rgba(16,6,24,0.74)" },
-  gold:   { neon:"#ffd166", dim:"#fff7df", border:"#ffb703", panel:"rgba(24,18,6,0.74)" },
-};
-function themeNow() {
-  const t = (process.env.CRYS_THEME || "gold").trim().toLowerCase();
-  return THEMES[t] || THEMES.gold;
-}
-function bgUrl() {
-  return (process.env.CRYS_MENU_BG || "").trim();
-}
-function fetchBuffer(url) {
-  return new Promise((resolve, reject) => {
-    const lib = url.startsWith("https") ? https : http;
-    lib.get(url, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return resolve(fetchBuffer(res.headers.location));
-      }
-      if (res.statusCode !== 200) {
-        res.resume();
-        return reject(new Error("HTTP " + res.statusCode));
-      }
-      const chunks = [];
-      res.on("data", (d) => chunks.push(d));
-      res.on("end", () => resolve(Buffer.concat(chunks)));
-    }).on("error", reject);
-  });
-}
-async function makeMenuCard(title, lines, size = 900) {
-  if (!Canvas) return null;
-  const { createCanvas, loadImage } = Canvas;
-  const theme = themeNow();
-
-  const w = size;
-  const pad = Math.round(size * 0.06);
-  const lineH = Math.round(size * 0.041);
-  const titleH = Math.round(size * 0.085);
-  const h = pad + titleH + 18 + lines.length * lineH + pad + 60;
-
-  const canvas = createCanvas(w, h);
-  const ctx = canvas.getContext("2d");
-
-  const bg = bgUrl();
-  if (bg) {
-    try {
-      const buf = await fetchBuffer(bg);
-      const img = await loadImage(buf);
-      const scale = Math.max(w / img.width, h / img.height);
-      const iw = img.width * scale, ih = img.height * scale;
-      ctx.drawImage(img, (w - iw) / 2, (h - ih) / 2, iw, ih);
-    } catch {
-      ctx.fillStyle = "#08110f"; ctx.fillRect(0, 0, w, h);
-    }
-  } else {
-    ctx.fillStyle = "#08110f"; ctx.fillRect(0, 0, w, h);
+function clientFor(provider) {
+  if (provider === "groq") {
+    if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY not set.");
+    return new OpenAI({ apiKey: GROQ_API_KEY, baseURL: "https://api.groq.com/openai/v1" });
   }
-
-  ctx.fillStyle = "rgba(0,0,0,0.48)"; ctx.fillRect(0, 0, w, h);
-  ctx.strokeStyle = theme.border; ctx.lineWidth = 3;
-  ctx.strokeRect(14, 14, w - 28, h - 28);
-  ctx.fillStyle = theme.panel;
-  ctx.fillRect(24, 24, w - 48, h - 48);
-
-  ctx.font = `bold ${Math.round(size * 0.055)}px Sans`;
-  ctx.fillStyle = theme.neon;
-  ctx.fillText(title, pad, pad + Math.round(size * 0.06));
-
-  ctx.strokeStyle = theme.border; ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(pad, pad + titleH);
-  ctx.lineTo(w - pad, pad + titleH);
-  ctx.stroke();
-
-  ctx.font = `${Math.round(size * 0.033)}px Sans`;
-  ctx.fillStyle = theme.dim;
-
-  let y = pad + titleH + Math.round(size * 0.055);
-  for (const ln of lines) { ctx.fillText(String(ln), pad, y); y += lineH; }
-
-  ctx.font = `${Math.round(size * 0.028)}px Sans`;
-  ctx.fillStyle = theme.neon;
-  ctx.fillText("CRYSNOVA AI • V3", pad, h - pad);
-
-  return canvas.toBuffer("image/png");
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY not set.");
+  return new OpenAI({ apiKey: OPENAI_API_KEY });
 }
 
-/* [PART 1 END] */
-/* [CRYSNOVA AI v3 — PART 2 / 3] */
-
-/* ----------------- AI CORE ----------------- */
 function baseSystem(mode) {
-  const modeHint = {
-    chat: "Be friendly, sharp, Nigerian-street-smart but respectful.",
+  const hint = {
+    chat: "Be friendly, sharp, Nigerian-street-smart but respectful. English + small Pidgin mix when it fits.",
     coach: "Be a practical coach. Give steps, plans, checklists.",
     writer: "Write premium content: captions, bios, scripts, hooks. Give 3 options + best pick.",
-    coder: "Debug + explain simply. Give clean code and how to paste it into KORD plugins.",
+    coder: "Debug + explain simply. Give clean code and how to paste into KORD plugins.",
     translate: "Translate cleanly. Keep meaning + tone. If Pidgin requested, do Naija Pidgin well.",
     summarize: "Summarize clearly into bullets, actions, and key points.",
-    roast: "Generate playful banter only. No hate, no threats, no family curses. Keep it witty.",
-    auto: "Reply short, helpful, natural. Avoid long essays. Avoid repeating system text."
+    roast: "Playful banter only. No hate, slurs, threats, or family curses. Keep it witty.",
+    auto: "You are replying in WhatsApp. Keep it short, natural, helpful. Avoid long essays."
   }[mode] || "Be helpful.";
 
   return (
     "You are CRYSNOVA AI, a premium WhatsApp assistant.\n" +
-    "Rules:\n" +
-    "- Keep responses concise but premium.\n" +
-    "- Never output hate, slurs, threats, doxxing, or sexual content.\n" +
-    "- If asked for harmful content, refuse and redirect.\n" +
-    "Mode:\n" + modeHint
+    "Safety rules:\n" +
+    "- No hate, slurs, threats, doxxing, scams, or sexual content.\n" +
+    "- If user requests harmful actions, refuse and redirect.\n" +
+    "Style:\n" + hint
   );
 }
 
-async function hfChat(model, messages) {
-  const token = KEYS.hf;
-  if (!token) throw new Error("HF_TOKEN not set.");
-  const r = await axios.post(
-    `https://api-inference.huggingface.co/models/${encodeURIComponent(model)}`,
-    { inputs: messages.map(x => x.content).join("\n\n") },
-    { headers: { Authorization: `Bearer ${token}` }, timeout: 60000 }
-  );
-  // HF responses vary
-  const out =
-    r?.data?.[0]?.generated_text ||
-    r?.data?.generated_text ||
-    (typeof r?.data === "string" ? r.data : "");
-  if (!out) throw new Error("HF returned empty output.");
-  return String(out).trim();
-}
+/* ---------- premium AI call with fallback (openai <-> groq) ---------- */
+async function aiReply(m, userText, mode, callKind /*manual|auto*/) {
+  const st = providerState(m);
+  const prefer = st.provider;
 
-function isRateLimitErr(e) {
-  const msg = String(e?.message || "");
-  return msg.includes("429") || msg.toLowerCase().includes("rate limit") || msg.toLowerCase().includes("quota");
-}
+  const model =
+    prefer === "groq" ? st.modelGroq : st.modelOpenAI;
 
-async function aiReply(m, userText, mode = "chat") {
-  const stProvider = getRuntimeProvider(m);
-  const stModel = getRuntimeModel(m);
-
-  // cooldown per chat to prevent spam
-  const cdKey = `${mode}::${getChatId(m)}`;
-  const left = checkCooldownKey(cdKey);
+  // cooldown keys
+  const chatId = getChatId(m);
+  const key = (callKind === "auto") ? `auto::${chatId}` : `manual::${ukey(m)}`;
+  const left = cooldownHit(key);
   if (left) throw new Error(`Cooldown: wait ${left}s`);
 
-  const history = loadMem(m).map(x => ({ role: x.role, content: x.content }));
+  // memory (manual keeps rolling context; auto uses short context)
+  const history = (callKind === "auto")
+    ? []
+    : loadMem(m).map(x => ({ role: x.role, content: x.content })).slice(-memCap());
+
   const messages = [
     { role: "system", content: baseSystem(mode) },
-    ...history.slice(-memCap()),
-    { role: "user", content: userText }
+    ...history,
+    { role: "user", content: String(userText || "") }
   ];
 
-  // Provider call
-  if (stProvider === "hf") {
-    const out = await hfChat(stModel, messages);
-    pushMem(m, "user", userText);
-    pushMem(m, "assistant", out);
-    return out;
+  async function run(provider) {
+    const c = clientFor(provider);
+    const useModel = provider === "groq" ? st.modelGroq : st.modelOpenAI;
+    const resp = await c.chat.completions.create({
+      model: useModel,
+      messages,
+      temperature: (mode === "roast") ? 0.95 : 0.7,
+    });
+    const out = resp?.choices?.[0]?.message?.content?.trim();
+    if (!out) throw new Error("AI returned empty response.");
+    return { out, provider, model: useModel };
   }
 
-  const client = openaiClientFor(stProvider);
-  if (!client) throw new Error(`${stProvider.toUpperCase()} key not set in ENV.`);
-
-  const resp = await client.chat.completions.create({
-    model: stModel,
-    messages,
-    temperature: (mode === "roast") ? 0.95 : 0.7,
-  });
-
-  const out = resp?.choices?.[0]?.message?.content?.trim();
-  if (!out) throw new Error("AI returned empty response.");
-
-  pushMem(m, "user", userText);
-  pushMem(m, "assistant", out);
-  return out;
+  // Try preferred first, then fallback to the other provider if possible
+  try {
+    const r = await run(prefer);
+    if (callKind !== "auto") {
+      pushMem(m, "user", userText);
+      pushMem(m, "assistant", r.out);
+    }
+    return r;
+  } catch (e1) {
+    const other = (prefer === "groq") ? "openai" : "groq";
+    try {
+      const r2 = await run(other);
+      if (callKind !== "auto") {
+        pushMem(m, "user", userText);
+        pushMem(m, "assistant", r2.out);
+      }
+      return r2;
+    } catch (e2) {
+      // return best error
+      const msg = (e1?.message || e1) + " | " + (e2?.message || e2);
+      throw new Error(msg);
+    }
+  }
 }
 
-/* ----------------- WEATHER + MUSIC ----------------- */
+/* ---------- weather + music ---------- */
 async function getWeather(city) {
   const apiKey = (process.env.OPENWEATHER_API_KEY || "").trim();
   if (!apiKey) return "Weather not configured: set OPENWEATHER_API_KEY.";
@@ -538,42 +403,161 @@ async function searchMusic(query) {
   };
 }
 
-/* ----------------- ROAST ----------------- */
+/* ---------- session + mode ---------- */
+function sessionState(m) {
+  const c = getChatPrefs(m);
+  return {
+    on: !!c.session_on,
+    mode: (c.session_mode || "tag").toLowerCase(), // tag|all
+  };
+}
+function setSession(m, on) { return setChatPrefs(m, { session_on: !!on }); }
+function setMode(m, mode) {
+  mode = String(mode || "").toLowerCase();
+  if (!["tag","all"].includes(mode)) return null;
+  setChatPrefs(m, { session_mode: mode });
+  return mode;
+}
+
+/* ---------- scheduler targets + config ---------- */
+function schedState(m) {
+  const c = getChatPrefs(m);
+  return {
+    enabled: !!c.sched_on,
+    on_h: Number.isFinite(+c.sched_on_h) ? +c.sched_on_h : 12,
+    on_m: Number.isFinite(+c.sched_on_m) ? +c.sched_on_m : 0,
+    off_h: Number.isFinite(+c.sched_off_h) ? +c.sched_off_h : 5,
+    off_m: Number.isFinite(+c.sched_off_m) ? +c.sched_off_m : 0,
+    targets: Array.isArray(c.sched_targets) ? c.sched_targets : [],
+  };
+}
+function setSched(m, patch) {
+  const c = getChatPrefs(m);
+  return setChatPrefs(m, { ...c, ...patch });
+}
+function normalizeJid(s) {
+  s = String(s || "").trim();
+  if (!s) return "";
+  if (s.includes("@g.us") || s.includes("@s.whatsapp.net")) return s;
+  const digits = s.replace(/\D/g, "");
+  if (!digits) return "";
+  return `${digits}@s.whatsapp.net`;
+}
+
+/* ---------- canvas menu (optional) ---------- */
+const THEMES = {
+  neon:   { neon:"#27ff9a", dim:"#eafff6", border:"#1ccf7b", panel:"rgba(6,24,15,0.72)" },
+  ice:    { neon:"#7df3ff", dim:"#e8fbff", border:"#3ad7ff", panel:"rgba(6,16,24,0.72)" },
+  purple: { neon:"#c77dff", dim:"#f4eaff", border:"#8a2be2", panel:"rgba(16,6,24,0.74)" },
+  gold:   { neon:"#ffd166", dim:"#fff7df", border:"#ffb703", panel:"rgba(24,18,6,0.74)" },
+};
+function themeNow() {
+  const t = (process.env.CRYS_THEME || "neon").trim().toLowerCase();
+  return THEMES[t] || THEMES.neon;
+}
+function fetchBuffer(url) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith("https") ? https : http;
+    lib.get(url, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) return resolve(fetchBuffer(res.headers.location));
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error("HTTP " + res.statusCode)); }
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+    }).on("error", reject);
+  });
+}
+async function makeMenuCard(title, lines, size = 900) {
+  if (!Canvas) return null;
+  const { createCanvas, loadImage } = Canvas;
+  const theme = themeNow();
+  const w = size;
+  const pad = Math.round(size * 0.06);
+  const lineH = Math.round(size * 0.041);
+  const titleH = Math.round(size * 0.085);
+  const h = pad + titleH + 18 + lines.length * lineH + pad + 60;
+
+  const canvas = createCanvas(w, h);
+  const ctx = canvas.getContext("2d");
+
+  ctx.fillStyle = "#06130d"; ctx.fillRect(0, 0, w, h);
+  const bg = (process.env.CRYS_MENU_BG || "").trim();
+  if (bg) {
+    try {
+      const buf = await fetchBuffer(bg);
+      const img = await loadImage(buf);
+      const scale = Math.max(w / img.width, h / img.height);
+      const iw = img.width * scale, ih = img.height * scale;
+      ctx.drawImage(img, (w - iw) / 2, (h - ih) / 2, iw, ih);
+    } catch {}
+  }
+
+  ctx.fillStyle = "rgba(0,0,0,0.48)"; ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = theme.border; ctx.lineWidth = 3;
+  ctx.strokeRect(14, 14, w - 28, h - 28);
+  ctx.fillStyle = theme.panel;
+  ctx.fillRect(24, 24, w - 48, h - 48);
+
+  ctx.font = `bold ${Math.round(size * 0.055)}px Sans`;
+  ctx.fillStyle = theme.neon;
+  ctx.fillText(title, pad, pad + Math.round(size * 0.06));
+
+  ctx.strokeStyle = theme.border; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(pad, pad + titleH);
+  ctx.lineTo(w - pad, pad + titleH);
+  ctx.stroke();
+
+  ctx.font = `${Math.round(size * 0.033)}px Sans`;
+  ctx.fillStyle = theme.dim;
+  let y = pad + titleH + Math.round(size * 0.055);
+  for (const ln of lines) { ctx.fillText(String(ln), pad, y); y += lineH; }
+
+  ctx.font = `${Math.round(size * 0.028)}px Sans`;
+  ctx.fillStyle = theme.neon;
+  ctx.fillText("CRYSNOVA AI • ULTRA", pad, h - pad);
+
+  return canvas.toBuffer("image/png");
+}
+
+/* [PART 2 END] */
+/* [CRYSNOVA AI ULTRA — PART 3 / 3] */
+
 function roastLevelOf(m) {
-  const p = getPrefs(m);
+  const p = getUserPrefs(m);
   return (p.roastlevel || "medium").toLowerCase();
 }
 function setRoastLevel(m, lvl) {
   lvl = String(lvl || "").toLowerCase();
   if (!["soft","medium","savage"].includes(lvl)) return null;
-  setPrefs(m, { roastlevel: lvl });
+  setUserPrefs(m, { roastlevel: lvl });
   return lvl;
 }
 async function doRoast(m, targetLabel) {
   const lvl = roastLevelOf(m);
   const instruction =
     lvl === "soft" ? "Keep it light, friendly, short." :
-    lvl === "savage" ? "Be very witty and sharp, but still no hate/threats/family curses." :
+    lvl === "savage" ? "Be very witty and sharp, but still no hate/slurs/threats/family curses." :
     "Be witty, street-smart, not too harsh.";
 
-  const text = await aiReply(
+  const r = await aiReply(
     m,
     `Generate ONE short Nigerian-style witty roast for: ${targetLabel}. ${instruction}`,
-    "roast"
+    "roast",
+    "manual"
   );
-  return text.replace(/\s+/g, " ").trim();
+  return r.out.replace(/\s+/g, " ").trim();
 }
 
-/* ----------------- MENU ----------------- */
 function menuLines(m) {
   const p = SAFE_PREFIX();
-  const st = sessionState(m);
-  const prov = getRuntimeProvider(m);
-  const mdl = getRuntimeModel(m);
-
+  const ss = sessionState(m);
+  const ps = providerState(m);
+  const sch = schedState(m);
   return [
-    `SESSION: ${st.on ? "ON" : "OFF"} • MODE: ${st.mode.toUpperCase()}`,
-    `AI: ${prov.toUpperCase()} • ${mdl}`,
+    `SESSION: ${ss.on ? "ON" : "OFF"} • MODE: ${ss.mode.toUpperCase()}`,
+    `PROVIDER: ${ps.provider.toUpperCase()} • MODEL: ${(ps.provider === "groq" ? ps.modelGroq : ps.modelOpenAI)}`,
+    `SCHED: ${sch.enabled ? "ON" : "OFF"} • ON ${String(sch.on_h).padStart(2,"0")}:${String(sch.on_m).padStart(2,"0")} • OFF ${String(sch.off_h).padStart(2,"0")}:${String(sch.off_m).padStart(2,"0")}`,
     "",
     "SESSION",
     `${p}crysnova on`,
@@ -582,37 +566,42 @@ function menuLines(m) {
     `${p}crysnova mode all`,
     `${p}crysnova status`,
     "",
-    "AI SWITCH",
-    `${p}crysnova provider`,
-    `${p}crysnova provider openai|openrouter|groq|gemini|hf`,
-    `${p}crysnova model <modelName>`,
-    `${p}crysnova useopenai`,
-    `${p}crysnova useopenrouter`,
-    `${p}crysnova usegroq`,
-    `${p}crysnova usegemini`,
+    "PROVIDER",
+    `${p}crysnova provider openai`,
+    `${p}crysnova provider groq`,
+    `${p}crysnova model <name>`,
+    `${p}crysnova setup`,
     "",
-    "AI MODES",
+    "AI",
     `${p}crysnova chat <msg>`,
     `${p}crysnova coach <msg>`,
     `${p}crysnova writer <msg>`,
     `${p}crysnova coder <msg>`,
     `${p}crysnova translate <text>`,
-    `${p}crysnova summarize   (reply)`,
+    `${p}crysnova summarize  (reply)`,
     "",
     "FUN",
     `${p}crysnova roast`,
     `${p}crysnova roast @user`,
-    `${p}crysnova lastroast   (reply)`,
-    `${p}crysnova roastlevel <soft|medium|savage>`,
+    `${p}crysnova lastroast (reply)`,
+    `${p}crysnova roastlevel soft|medium|savage`,
     "",
     "UTILS",
     `${p}crysnova weather <city>`,
     `${p}crysnova setcity <city>`,
     `${p}crysnova music <query>`,
     "",
+    "SCHEDULER (TARGETS)",
+    `${p}crysnova sched on`,
+    `${p}crysnova sched off`,
+    `${p}crysnova sched add <jid|groupid>`,
+    `${p}crysnova sched add here`,
+    `${p}crysnova sched list`,
+    `${p}crysnova sched clear`,
+    "",
     "MEMORY",
     `${p}crysnova mem`,
-    `${p}crysnova memclear`
+    `${p}crysnova memclear`,
   ];
 }
 
@@ -622,76 +611,49 @@ async function sendMenu(m) {
   return sendText(m, "CRYSNOVA AI\n\n" + menuLines(m).join("\n"));
 }
 
-/* [PART 2 END] */
-/* [CRYSNOVA AI v3 — PART 3 / 3] */
-
-/* ----------------- MAIN COMMAND ROUTER ----------------- */
+/* ---------- main command ---------- */
 kord(
   {
     cmd: "crysnova|crys",
-    desc: "Crysnova AI (premium assistant + session auto-reply + provider switch)",
+    desc: "Crysnova AI ULTRA (session + auto reply + scheduler)",
     fromMe: wtype,
     type: "tools",
-    react: "🌟",
+    react: "💎",
   },
-  async (m, text) => {
+  async (m, textArg) => {
     try {
-      const raw = getTextFromAny(m, text).trim();
-      const args = raw.split(/\s+/).filter(Boolean);
-      const sub = (args[0] || "menu").toLowerCase();
-      const rest = args.slice(1).join(" ").trim();
+      const { sub, rest, parts } = parseSubArgs(m, textArg, "crysnova|crys");
       const p = SAFE_PREFIX();
 
-      /* ---- PROVIDER + MODEL SWITCH (FIXED: INSIDE ROUTER) ---- */
-      if (sub === "provider") {
-        if (!rest) {
-          return sendText(
-            m,
-            `PROVIDER: ${getRuntimeProvider(m)}\nMODEL: ${getRuntimeModel(m)}\n\nSet:\n${p}crysnova provider openai|openrouter|groq|gemini|hf`
-          );
-        }
-        if (!isAllowed(m)) return;
+      // menu/help
+      if (sub === "menu" || sub === "help") return sendMenu(m);
 
-        const pp = setRuntimeProvider(m, rest);
-        if (!pp) return sendText(m, `Invalid provider.\nUse: ${p}crysnova provider openai|openrouter|groq|gemini|hf`);
-        return sendText(m, `Provider set: ${pp}\nModel: ${getRuntimeModel(m)}`);
-      }
-
-      if (sub === "model") {
-        if (!rest) return sendText(m, `Use: ${p}crysnova model <modelName>`);
-        if (!isAllowed(m)) return;
-
-        const mm = setRuntimeModel(m, rest);
-        if (!mm) return sendText(m, "Invalid model name.");
-        return sendText(m, `Model set: ${mm}\nProvider: ${getRuntimeProvider(m)}`);
-      }
-
-      if (sub === "useopenai") {
-        if (!isAllowed(m)) return;
-        setRuntimeProvider(m, "openai");
-        setRuntimeModel(m, DEFAULTS.openai);
-        return sendText(m, `Switched to OPENAI: ${getRuntimeModel(m)}`);
-      }
-      if (sub === "useopenrouter") {
-        if (!isAllowed(m)) return;
-        setRuntimeProvider(m, "openrouter");
-        setRuntimeModel(m, DEFAULTS.openrouter);
-        return sendText(m, `Switched to OPENROUTER: ${getRuntimeModel(m)}`);
-      }
-      if (sub === "usegroq") {
-        if (!isAllowed(m)) return;
-        setRuntimeProvider(m, "groq");
-        setRuntimeModel(m, DEFAULTS.groq);
-        return sendText(m, `Switched to GROQ: ${getRuntimeModel(m)}`);
-      }
-      if (sub === "usegemini") {
-        if (!isAllowed(m)) return;
-        setRuntimeProvider(m, "gemini");
-        setRuntimeModel(m, DEFAULTS.gemini);
-        return sendText(m, `Switched to GEMINI: ${getRuntimeModel(m)}`);
+      // setup
+      if (sub === "setup") {
+        const ps = providerState(m);
+        const okO = OPENAI_API_KEY ? "✅" : "❌";
+        const okG = GROQ_API_KEY ? "✅" : "❌";
+        const okW = (process.env.OPENWEATHER_API_KEY || "").trim() ? "✅" : "❌";
+        const ss = sessionState(m);
+        const sch = schedState(m);
+        return sendText(
+          m,
+          `SETUP\n` +
+          `Session: ${ss.on ? "ON" : "OFF"} • Mode: ${ss.mode.toUpperCase()}\n` +
+          `OpenAI Key: ${okO}\n` +
+          `Groq Key: ${okG}\n` +
+          `Provider: ${ps.provider}\n` +
+          `Model(OpenAI): ${ps.modelOpenAI}\n` +
+          `Model(Groq): ${ps.modelGroq}\n` +
+          `Weather Key: ${okW}\n` +
+          `Memory: ${memCap()} turns\n` +
+          `Cooldown: ${cdSec()}s\n` +
+          `Theme: ${(process.env.CRYS_THEME || "neon")}\n` +
+          `Scheduler: ${sch.enabled ? "ON" : "OFF"} • Targets: ${sch.targets.length}`
+        );
       }
 
-      /* ---- SESSION CONTROLS ---- */
+      // session controls
       if (sub === "on") {
         if (!isAllowed(m)) return;
         setSession(m, true);
@@ -709,42 +671,81 @@ kord(
         return sendText(m, `Mode set: ${md.toUpperCase()}`);
       }
       if (sub === "status") {
-        const st = sessionState(m);
-        return sendText(m, `Session: ${st.on ? "ON" : "OFF"}\nMode: ${st.mode.toUpperCase()}\nProvider: ${getRuntimeProvider(m)}\nModel: ${getRuntimeModel(m)}`);
-      }
-
-      /* ---- MENU / HELP / SETUP ---- */
-      if (sub === "menu" || sub === "help") return sendMenu(m);
-
-      if (sub === "setup") {
-        const prov = getRuntimeProvider(m);
-        const mdl = getRuntimeModel(m);
-
-        const okOpenAI = KEYS.openai ? "✅" : "❌";
-        const okOR = KEYS.openrouter ? "✅" : "❌";
-        const okGroq = KEYS.groq ? "✅" : "❌";
-        const okGem = KEYS.gemini ? "✅" : "❌";
-        const okHF = KEYS.hf ? "✅" : "❌";
-        const okW = (process.env.OPENWEATHER_API_KEY || "").trim() ? "✅" : "❌";
-
+        const ss = sessionState(m);
+        const ps = providerState(m);
+        const sch = schedState(m);
         return sendText(
           m,
-          `SETUP\n` +
-          `Provider: ${prov}\n` +
-          `Model: ${mdl}\n\n` +
-          `OPENAI_API_KEY: ${okOpenAI}\n` +
-          `OPENROUTER_API_KEY: ${okOR}\n` +
-          `GROQ_API_KEY: ${okGroq}\n` +
-          `GEMINI_API_KEY: ${okGem}\n` +
-          `HF_TOKEN: ${okHF}\n` +
-          `OPENWEATHER_API_KEY: ${okW}\n\n` +
-          `Memory: ${memCap()} turns\n` +
-          `Cooldown: ${cdSec()}s\n` +
-          `Theme: ${(process.env.CRYS_THEME || "gold")}`
+          `Session: ${ss.on ? "ON" : "OFF"}\n` +
+          `Mode: ${ss.mode.toUpperCase()}\n` +
+          `Provider: ${ps.provider.toUpperCase()}\n` +
+          `Model: ${(ps.provider === "groq" ? ps.modelGroq : ps.modelOpenAI)}\n` +
+          `Scheduler: ${sch.enabled ? "ON" : "OFF"} • Targets: ${sch.targets.length}`
         );
       }
 
-      /* ---- MEMORY ---- */
+      // provider switch
+      if (sub === "provider") {
+        if (!isAllowed(m)) return;
+        const pv = setProvider(m, rest);
+        if (!pv) return sendText(m, `Use: ${p}crysnova provider openai|groq`);
+        return sendText(m, `Provider set: ${pv}`);
+      }
+      if (sub === "model") {
+        if (!isAllowed(m)) return;
+        const ps = providerState(m);
+        const md = setModel(m, ps.provider, rest);
+        if (!md) return sendText(m, `Use: ${p}crysnova model <modelName>`);
+        return sendText(m, `Model set for ${ps.provider.toUpperCase()}: ${md}`);
+      }
+
+      // scheduler controls
+      if (sub === "sched") {
+        if (!isAllowed(m)) return;
+        const action = (parts[0] || "").toLowerCase();
+        const sch = schedState(m);
+
+        if (action === "on") {
+          setSched(m, { sched_on: true });
+          return sendText(m, "Scheduler ON.");
+        }
+        if (action === "off") {
+          setSched(m, { sched_on: false });
+          return sendText(m, "Scheduler OFF.");
+        }
+        if (action === "add") {
+          const arg = parts[1] || "";
+          let jid = "";
+          if (String(arg).toLowerCase() === "here") jid = getChatId(m);
+          else jid = normalizeJid(arg);
+
+          if (!jid) return sendText(m, `Use: ${p}crysnova sched add here  OR  ${p}crysnova sched add <jid|groupid>`);
+          const next = Array.from(new Set([...(sch.targets || []), jid]));
+          setSched(m, { sched_targets: next });
+          return sendText(m, `Scheduler target added: ${jid}\nTotal targets: ${next.length}`);
+        }
+        if (action === "list") {
+          const list = (sch.targets || []);
+          if (!list.length) return sendText(m, "Scheduler target list is empty.");
+          return sendText(m, "Scheduler targets:\n" + list.map((x,i)=>`${i+1}. ${x}`).join("\n"));
+        }
+        if (action === "clear") {
+          setSched(m, { sched_targets: [] });
+          return sendText(m, "Scheduler targets cleared.");
+        }
+
+        return sendText(
+          m,
+          `Scheduler commands:\n` +
+          `${p}crysnova sched on|off\n` +
+          `${p}crysnova sched add here\n` +
+          `${p}crysnova sched add <jid|groupid>\n` +
+          `${p}crysnova sched list\n` +
+          `${p}crysnova sched clear`
+        );
+      }
+
+      // memory
       if (sub === "mem") {
         const hist = loadMem(m);
         return sendText(m, `Memory saved: ${hist.length}/${memCap()}`);
@@ -754,57 +755,55 @@ kord(
         return sendText(m, "Memory cleared for this chat/user.");
       }
 
-      /* ---- ROAST SETTINGS ---- */
+      // roast level
       if (sub === "roastlevel") {
         const lvl = setRoastLevel(m, rest);
         if (!lvl) return sendText(m, "Use: crysnova roastlevel soft|medium|savage");
         return sendText(m, `Roast level set: ${lvl}`);
       }
 
-      /* ---- WEATHER ---- */
+      // setcity/weather
       if (sub === "setcity") {
         if (!rest) return sendText(m, "Use: crysnova setcity <city>");
-        setPrefs(m, { city: rest });
+        setUserPrefs(m, { city: rest });
         return sendText(m, `Default city set: ${rest}`);
       }
       if (sub === "weather") {
-        const prefs = getPrefs(m);
-        const city = rest || prefs.city;
-        if (!city) return sendText(m, "Use: crysnova weather <city>  (or set default with crysnova setcity <city>)");
+        const up = getUserPrefs(m);
+        const city = rest || up.city;
+        if (!city) return sendText(m, "Use: crysnova weather <city> (or set default: crysnova setcity <city>)");
         const rep = await getWeather(city);
         return sendText(m, rep);
       }
 
-      /* ---- MUSIC ---- */
+      // music
       if (sub === "music") {
         if (!rest) return sendText(m, "Use: crysnova music <song or artist>");
         const result = await searchMusic(rest);
         await sendText(m, result.text);
-        if (result.preview) {
+        if (result.preview && m?.client?.sendMessage) {
           try {
-            if (m?.client?.sendMessage) {
-              return await m.client.sendMessage(getChatId(m), { audio: { url: result.preview }, mimetype: "audio/mp4" }, { quoted: m });
-            }
+            return await m.client.sendMessage(getChatId(m), { audio: { url: result.preview }, mimetype: "audio/mp4" }, { quoted: m });
           } catch {}
         }
         return null;
       }
 
-      /* ---- SUMMARIZE QUOTED ---- */
+      // summarize (reply)
       if (sub === "summarize") {
         const quoted = m?.quoted;
         const qtxt = quoted?.text || quoted?.msg || "";
         if (!qtxt) return sendText(m, "Reply to a message then use: crysnova summarize");
-        const out = await aiReply(m, `Summarize this:\n\n${qtxt}`, "summarize");
-        return sendText(m, out);
+        const r = await aiReply(m, `Summarize this:\n\n${qtxt}`, "summarize", "manual");
+        return sendText(m, r.out);
       }
 
-      /* ---- ROAST ---- */
+      // roast / lastroast
       if (sub === "roast") {
         if (m?.mentionedJid?.length) {
           const user = m.mentionedJid[0];
           const roast = await doRoast(m, `@${user.split("@")[0]}`);
-          return sendText(m, withMentions(`${roast}`, [user]));
+          return sendText(m, withMentions(roast, [user]));
         }
         const roast = await doRoast(m, "me");
         return sendText(m, roast);
@@ -814,15 +813,15 @@ kord(
         if (!q) return sendText(m, "Reply to someone’s message, then use: crysnova lastroast");
         const user = q.sender;
         const roast = await doRoast(m, `@${String(user || "").split("@")[0] || "user"}`);
-        return sendText(m, withMentions(`${roast}`, user ? [user] : []));
+        return sendText(m, withMentions(roast, user ? [user] : []));
       }
 
-      /* ---- AI MODES ---- */
-      const modeMap = new Set(["chat","coach","writer","coder","translate"]);
-      if (modeMap.has(sub)) {
+      // AI modes
+      const modes = new Set(["chat","coach","writer","coder","translate"]);
+      if (modes.has(sub)) {
         if (!rest) return sendText(m, `Use: ${p}crysnova ${sub} <message>`);
-        const out = await aiReply(m, rest, sub);
-        return sendText(m, out);
+        const r = await aiReply(m, rest, sub, "manual");
+        return sendText(m, r.out);
       }
 
       return sendText(m, `Unknown. Try: ${p}crysnova menu`);
@@ -832,63 +831,124 @@ kord(
   }
 );
 
-/* ----------------- AUTO-REPLY LISTENER -----------------
-   When Session is ON:
-   - Mode TAG: only reply when you/bot are mentioned
-   - Mode ALL: reply to everyone
-   Skips commands (prefix) to avoid replying to bot commands.
--------------------------------------------------------- */
+/* ---------- AUTO-REPLY LISTENER ---------- */
 kord({ on: "all" }, async (m, textArg) => {
   try {
     if (!m) return;
     if (m?.fromMe) return;
 
-    const st = sessionState(m);
-    if (!st.on) return;
+    const ss = sessionState(m);
+    if (!ss.on) return;
 
-    if (st.mode === "tag" && !isTaggedForSession(m)) return;
+    // tag mode requires mention (bot or owner)
+    if (ss.mode === "tag" && !isTaggedForSession(m)) return;
 
     const txt = getTextFromAny(m, textArg).trim();
     if (!txt) return;
 
+    // ignore commands to prevent "check menu" loops
     const p = SAFE_PREFIX();
     if (txt.startsWith(p)) return;
 
-    const cdKey = "auto::" + getChatId(m);
-    const left = checkCooldownKey(cdKey);
-    if (left) return;
+    // ignore extremely long spam
+    if (txt.length > 3000) return;
 
     const name = m?.pushName ? String(m.pushName).trim() : "user";
     const prompt =
-      `Reply to this WhatsApp message as CRYSNOVA AI.\n` +
+      `Reply as CRYSNOVA AI.\n` +
       `Sender: ${name}\n` +
       `Message: ${txt}\n\n` +
       `Reply short, helpful, natural.`;
 
-    let out;
-    try {
-      out = await aiReply(m, prompt, "auto");
-    } catch (e) {
-      // If current provider/model rate-limited, auto fallback chain:
-      if (isRateLimitErr(e)) {
-        // try openrouter -> groq -> gemini -> openai (whichever has key)
-        const tries = ["openrouter","groq","gemini","openai"];
-        for (const pr of tries) {
-          if (!KEYS[pr]) continue;
-          try {
-            setRuntimeProvider(m, pr);
-            out = await aiReply(m, prompt, "auto");
-            break;
-          } catch {}
+    const r = await aiReply(m, prompt, "auto", "auto");
+    return sendText(m, r.out);
+  } catch {
+    // silent (premium: no spam)
+    return;
+  }
+});
+
+/* ---------- SCHEDULER LOOP (Africa/Lagos) ----------
+   Sends ON at 12:00, OFF at 05:00 to saved target chats.
+   NOTE: "auto-scheduler takes send and others off" meaning:
+   - Scheduler only toggles Session ON/OFF
+   - It does NOT spam replies; it only changes state.
+---------------------------------------------------- */
+let LAST_TICK = { on: "", off: "" };
+
+function lagosNowParts() {
+  const d = new Date();
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Africa/Lagos",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false
+  });
+  const parts = fmt.formatToParts(d).reduce((a, p) => (a[p.type] = p.value, a), {});
+  const y = parts.year, mo = parts.month, da = parts.day;
+  const hh = parseInt(parts.hour, 10);
+  const mm = parseInt(parts.minute, 10);
+  return { y, mo, da, hh, mm, keyDay: `${y}-${mo}-${da}` };
+}
+
+async function schedSendToggle(client, jid, on) {
+  try {
+    setChatPrefsById(jid, { session_on: !!on }); // toggle the session for that chat
+    const msg = on ? "Session ON. Mode: ALL" : "Session OFF.";
+    if (client?.sendMessage) {
+      await client.sendMessage(jid, { text: msg });
+    }
+  } catch {}
+}
+
+setInterval(async () => {
+  try {
+    // We need a client ref — grab from last known? We can pull from global by caching from messages.
+    // If no cached client yet, scheduler will begin once bot receives any message.
+    if (!global.__CRYS_CLIENT) return;
+
+    const now = lagosNowParts();
+    const dayKey = now.keyDay;
+
+    // iterate chats stored in prefs to find scheduler-enabled ones + their targets
+    const db = readJSON(PREF_FILE, { users: {}, chats: {} });
+    const chats = db.chats || {};
+    for (const chatId of Object.keys(chats)) {
+      const c = chats[chatId] || {};
+      if (!c.sched_on) continue;
+      const targets = Array.isArray(c.sched_targets) ? c.sched_targets : [];
+      if (!targets.length) continue;
+
+      const onH = Number.isFinite(+c.sched_on_h) ? +c.sched_on_h : 12;
+      const onM = Number.isFinite(+c.sched_on_m) ? +c.sched_on_m : 0;
+      const offH = Number.isFinite(+c.sched_off_h) ? +c.sched_off_h : 5;
+      const offM = Number.isFinite(+c.sched_off_m) ? +c.sched_off_m : 0;
+
+      // ON tick (once per day)
+      if (now.hh === onH && now.mm === onM) {
+        const tickKey = `${dayKey}::on::${chatId}`;
+        if (LAST_TICK.on !== tickKey) {
+          LAST_TICK.on = tickKey;
+          for (const t of targets) await schedSendToggle(global.__CRYS_CLIENT, t, true);
+        }
+      }
+
+      // OFF tick (once per day)
+      if (now.hh === offH && now.mm === offM) {
+        const tickKey = `${dayKey}::off::${chatId}`;
+        if (LAST_TICK.off !== tickKey) {
+          LAST_TICK.off = tickKey;
+          for (const t of targets) await schedSendToggle(global.__CRYS_CLIENT, t, false);
         }
       }
     }
+  } catch {}
+}, 20 * 1000);
 
-    if (!out) return;
-    return sendText(m, out);
-  } catch {
-    return;
-  }
+/* cache client for scheduler */
+kord({ on: "all" }, async (m) => {
+  try {
+    if (m?.client) global.__CRYS_CLIENT = m.client;
+  } catch {}
 });
 
 module.exports = {};
