@@ -5,6 +5,7 @@ const http = require("http");
 
 const axios = require("axios");
 const OpenAI = require("openai");
+const cron = require("node-cron");
 
 const { kord, wtype, config, prefix } = require("../core");
 
@@ -81,9 +82,7 @@ async function sendText(m, txt, opt = {}) {
   return null;
 }
 async function sendImage(m, buf, caption = "", opt = {}) {
-  try {
-    if (typeof m.replyimg === "function") return await m.replyimg(buf, caption);
-  } catch {}
+  try { if (typeof m.replyimg === "function") return await m.replyimg(buf, caption); } catch {}
   try {
     if (m?.client?.sendMessage) {
       return await m.client.sendMessage(getChatId(m), { image: buf, caption, ...opt }, { quoted: m });
@@ -104,7 +103,7 @@ const PREF_FILE = path.join(DATA_DIR, "prefs.json");
 function ensureDirs() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(MEM_FILE)) fs.writeFileSync(MEM_FILE, JSON.stringify({ users: {} }, null, 2));
-  if (!fs.existsSync(PREF_FILE)) fs.writeFileSync(PREF_FILE, JSON.stringify({ users: {} }, null, 2));
+  if (!fs.existsSync(PREF_FILE)) fs.writeFileSync(PREF_FILE, JSON.stringify({ users: {}, chats: {}, targets: {}, sched: {} }, null, 2));
 }
 function readJSON(file, fallback) {
   ensureDirs();
@@ -114,34 +113,77 @@ function writeJSON(file, obj) {
   ensureDirs();
   fs.writeFileSync(file, JSON.stringify(obj, null, 2), "utf8");
 }
-function ukey(m) {
-  return `${getChatId(m)}::${getSenderId(m)}`;
-}
-function chatKey(m) {
-  // group-wide session per chat (NOT per user)
-  return `${getChatId(m)}`;
-}
+function ukey(m) { return `${getChatId(m)}::${getSenderId(m)}`; }
+function chatKey(m) { return `${getChatId(m)}`; }
+
 function getPrefs(m) {
-  const db = readJSON(PREF_FILE, { users: {}, chats: {} });
+  const db = readJSON(PREF_FILE, { users: {}, chats: {}, targets: {}, sched: {} });
   return db.users[ukey(m)] || {};
 }
 function setPrefs(m, patch) {
-  const db = readJSON(PREF_FILE, { users: {}, chats: {} });
+  const db = readJSON(PREF_FILE, { users: {}, chats: {}, targets: {}, sched: {} });
   const k = ukey(m);
   db.users[k] = { ...(db.users[k] || {}), ...patch };
   writeJSON(PREF_FILE, db);
   return db.users[k];
 }
 function getChatPrefs(m) {
-  const db = readJSON(PREF_FILE, { users: {}, chats: {} });
+  const db = readJSON(PREF_FILE, { users: {}, chats: {}, targets: {}, sched: {} });
   return db.chats[chatKey(m)] || {};
 }
 function setChatPrefs(m, patch) {
-  const db = readJSON(PREF_FILE, { users: {}, chats: {} });
+  const db = readJSON(PREF_FILE, { users: {}, chats: {}, targets: {}, sched: {} });
   const k = chatKey(m);
   db.chats[k] = { ...(db.chats[k] || {}), ...patch };
   writeJSON(PREF_FILE, db);
   return db.chats[k];
+}
+
+/* ----------------- TARGETS (broadcast list) ----------------- */
+function getTargets() {
+  const db = readJSON(PREF_FILE, { users: {}, chats: {}, targets: {}, sched: {} });
+  return db.targets || {};
+}
+function setTargets(obj) {
+  const db = readJSON(PREF_FILE, { users: {}, chats: {}, targets: {}, sched: {} });
+  db.targets = obj || {};
+  writeJSON(PREF_FILE, db);
+}
+function addTarget(chatId) {
+  const t = getTargets();
+  t[chatId] = { addedAt: Date.now() };
+  setTargets(t);
+}
+function delTarget(chatId) {
+  const t = getTargets();
+  delete t[chatId];
+  setTargets(t);
+}
+function listTargets() {
+  const t = getTargets();
+  return Object.keys(t);
+}
+function clearTargets() {
+  setTargets({});
+}
+
+/* ----------------- SCHEDULER PREFS ----------------- */
+function getSched() {
+  const db = readJSON(PREF_FILE, { users: {}, chats: {}, targets: {}, sched: {} });
+  const s = db.sched || {};
+  return {
+    enabled: !!s.enabled,
+    onTime: s.onTime || "12:00",
+    offTime: s.offTime || "05:00",
+    msgOn: s.msgOn || "CRYSNOVA session enabled.",
+    msgOff: s.msgOff || "CRYSNOVA session disabled.",
+  };
+}
+function setSched(patch) {
+  const db = readJSON(PREF_FILE, { users: {}, chats: {}, targets: {}, sched: {} });
+  db.sched = { ...(db.sched || {}), ...(patch || {}) };
+  writeJSON(PREF_FILE, db);
+  return getSched();
 }
 
 /* ----------------- MEMORY (rolling) ----------------- */
@@ -187,23 +229,39 @@ function checkCooldownKey(key) {
   return null;
 }
 
-/* ----------------- OPENAI ----------------- */
+/* ----------------- OPENAI (primary + fallback) ----------------- */
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
-const MODEL = (process.env.CRYS_MODEL || "gpt-4o-mini").trim();
-const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+const OPENAI_API_KEY2 = (process.env.OPENAI_API_KEY2 || "").trim();
 
-/* ----------------- SESSION + MODE ----------------- */
+const MODEL = (process.env.CRYS_MODEL || "gpt-4o-mini").trim();
+const FALLBACK_MODEL = (process.env.CRYS_FALLBACK_MODEL || "gpt-4.1").trim();
+
+const openai1 = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+const openai2 = OPENAI_API_KEY2 ? new OpenAI({ apiKey: OPENAI_API_KEY2 }) : null;
+
+function shouldFallback(errMsg) {
+  const s = String(errMsg || "").toLowerCase();
+  return (
+    s.includes("rate limit") ||
+    s.includes("429") ||
+    s.includes("tpm") ||
+    s.includes("quota") ||
+    s.includes("insufficient") ||
+    s.includes("billing") ||
+    s.includes("hard limit") ||
+    s.includes("credits")
+  );
+}
+
+/* ----------------- SESSION + MODE (per chat) ----------------- */
 function sessionState(m) {
-  // per chat session
   const c = getChatPrefs(m);
   return {
     on: !!c.session_on,
     mode: (c.session_mode || "tag").toLowerCase(), // tag | all
   };
 }
-function setSession(m, on) {
-  return setChatPrefs(m, { session_on: !!on });
-}
+function setSession(m, on) { return setChatPrefs(m, { session_on: !!on }); }
 function setMode(m, mode) {
   mode = String(mode || "").toLowerCase();
   if (!["tag", "all"].includes(mode)) return null;
@@ -211,6 +269,7 @@ function setMode(m, mode) {
   return mode;
 }
 
+/* ----------------- TAG DETECTION (robust) ----------------- */
 function getBotJid(m) {
   const a = m?.client?.user?.id || m?.client?.user?.jid || m?.user?.id || "";
   if (a && typeof a === "string") return a.includes("@") ? a : `${a}@s.whatsapp.net`;
@@ -219,14 +278,12 @@ function getBotJid(m) {
   if (bn) return `${String(bn).replace(/\D/g, "")}@s.whatsapp.net`;
   return "";
 }
-
 function getOwnerJidGuess() {
   const cfg = getCfgAny();
   const n = cfg?.OWNER_NUMBER || cfg?.OWNER || cfg?.OWNERNUM || "";
   const digits = String(n || "").replace(/\D/g, "");
   return digits ? `${digits}@s.whatsapp.net` : "";
 }
-
 function isTaggedForSession(m) {
   const mentioned = Array.isArray(m?.mentionedJid) ? m.mentionedJid : [];
   if (!mentioned.length) return false;
@@ -237,7 +294,6 @@ function isTaggedForSession(m) {
   if (bot && mentioned.includes(bot)) return true;
   if (owner && mentioned.includes(owner)) return true;
 
-  // also accept if bot number tagged without @s.whatsapp.net match (some cores)
   const botNum = bot ? bot.split("@")[0] : "";
   const ownerNum = owner ? owner.split("@")[0] : "";
   return mentioned.some(j => {
@@ -257,9 +313,7 @@ function themeNow() {
   const t = (process.env.CRYS_THEME || "neon").trim().toLowerCase();
   return THEMES[t] || THEMES.neon;
 }
-function bgUrl() {
-  return (process.env.CRYS_MENU_BG || "").trim();
-}
+function bgUrl() { return (process.env.CRYS_MENU_BG || "").trim(); }
 function fetchBuffer(url) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith("https") ? https : http;
@@ -267,10 +321,7 @@ function fetchBuffer(url) {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return resolve(fetchBuffer(res.headers.location));
       }
-      if (res.statusCode !== 200) {
-        res.resume();
-        return reject(new Error("HTTP " + res.statusCode));
-      }
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error("HTTP " + res.statusCode)); }
       const chunks = [];
       res.on("data", (d) => chunks.push(d));
       res.on("end", () => resolve(Buffer.concat(chunks)));
@@ -330,14 +381,12 @@ async function makeMenuCard(title, lines, size = 900) {
 
   ctx.font = `${Math.round(size * 0.028)}px Sans`;
   ctx.fillStyle = theme.neon;
-  ctx.fillText("CRYSNOVA AI • SESSION MODE", pad, h - pad);
+  ctx.fillText("CRYSNOVA AI • v3", pad, h - pad);
 
   return canvas.toBuffer("image/png");
 }
 
 /* [PART 1 END] */
-/* [CRYSNOVA AI v2 — PART 2 / 3] */
-
 /* ----------------- AI CORE ----------------- */
 function baseSystem(mode) {
   const modeHint = {
@@ -347,8 +396,8 @@ function baseSystem(mode) {
     coder: "Debug + explain simply. Give clean code and how to paste it into KORD plugins.",
     translate: "Translate cleanly. Keep meaning + tone. If Pidgin requested, do Naija Pidgin well.",
     summarize: "Summarize clearly into bullets, actions, and key points.",
-    roast: "Generate playful banter only. No slurs, no hate, no threats, no family curses. Keep it witty.",
-    auto: "You are replying in a WhatsApp group. Keep it short, helpful, and natural. Avoid long essays."
+    roast: "Generate playful banter only. No slurs, hate, threats, or family curses. Keep it witty.",
+    auto: "You are replying in WhatsApp. Keep it short, helpful, and natural. Avoid long essays."
   }[mode] || "Be helpful.";
 
   return (
@@ -361,10 +410,18 @@ function baseSystem(mode) {
   );
 }
 
-async function aiReply(m, userText, mode = "chat") {
-  if (!openai) throw new Error("OPENAI_API_KEY not set.");
+async function callOpenAI(client, model, messages, temperature) {
+  return await client.chat.completions.create({
+    model,
+    messages,
+    temperature,
+  });
+}
 
-  // cooldown per chat session, not per user
+async function aiReply(m, userText, mode = "chat") {
+  if (!openai1) throw new Error("OPENAI_API_KEY not set.");
+
+  // cooldown per chat
   const cdKey = "chat::" + getChatId(m);
   const left = checkCooldownKey(cdKey);
   if (left) throw new Error(`Cooldown: wait ${left}s`);
@@ -376,18 +433,36 @@ async function aiReply(m, userText, mode = "chat") {
     { role: "user", content: userText }
   ];
 
-  const resp = await openai.chat.completions.create({
-    model: MODEL,
-    messages,
-    temperature: (mode === "roast") ? 0.95 : 0.7,
-  });
+  const temp = (mode === "roast") ? 0.95 : 0.7;
 
-  const out = resp?.choices?.[0]?.message?.content?.trim();
-  if (!out) throw new Error("AI returned empty response.");
+  try {
+    const resp = await callOpenAI(openai1, MODEL, messages, temp);
+    const out = resp?.choices?.[0]?.message?.content?.trim();
+    if (!out) throw new Error("AI returned empty response.");
+    pushMem(m, "user", userText);
+    pushMem(m, "assistant", out);
+    return out;
+  } catch (e) {
+    const msg = e?.message || String(e);
 
-  pushMem(m, "user", userText);
-  pushMem(m, "assistant", out);
-  return out;
+    // fallback model / key
+    if (shouldFallback(msg) && (openai2 || FALLBACK_MODEL)) {
+      try {
+        const client2 = openai2 || openai1;
+        const model2 = FALLBACK_MODEL || MODEL;
+        const resp2 = await callOpenAI(client2, model2, messages, temp);
+        const out2 = resp2?.choices?.[0]?.message?.content?.trim();
+        if (!out2) throw new Error("AI returned empty response (fallback).");
+        pushMem(m, "user", userText);
+        pushMem(m, "assistant", out2);
+        return out2;
+      } catch (e2) {
+        throw new Error((e2?.message || String(e2)) + " (fallback)");
+      }
+    }
+
+    throw new Error(msg);
+  }
 }
 
 /* ----------------- WEATHER + MUSIC ----------------- */
@@ -426,13 +501,28 @@ async function searchMusic(query) {
 function menuLines(m) {
   const p = SAFE_PREFIX();
   const st = sessionState(m);
+  const sch = getSched();
+  const tg = listTargets();
   return [
     `SESSION: ${st.on ? "ON" : "OFF"} • MODE: ${st.mode.toUpperCase()}`,
+    `SCHED: ${sch.enabled ? "ON" : "OFF"} • ON ${sch.onTime} • OFF ${sch.offTime}`,
+    `TARGETS: ${tg.length}`,
+    "",
     `${p}crysnova on`,
     `${p}crysnova off`,
     `${p}crysnova mode tag`,
     `${p}crysnova mode all`,
     `${p}crysnova status`,
+    "",
+    `${p}crysnova targets add`,
+    `${p}crysnova targets del`,
+    `${p}crysnova targets list`,
+    `${p}crysnova sched on`,
+    `${p}crysnova sched off`,
+    `${p}crysnova sched seton HH:MM`,
+    `${p}crysnova sched setoff HH:MM`,
+    `${p}crysnova sched msgon <text>`,
+    `${p}crysnova sched msgoff <text>`,
     "",
     "AI MODES",
     `${p}crysnova chat <msg>`,
@@ -440,12 +530,12 @@ function menuLines(m) {
     `${p}crysnova writer <msg>`,
     `${p}crysnova coder <msg>`,
     `${p}crysnova translate <text>`,
-    `${p}crysnova summarize   (reply)`,
+    `${p}crysnova summarize  (reply)`,
     "",
     "FUN",
     `${p}crysnova roast`,
     `${p}crysnova roast @user`,
-    `${p}crysnova lastroast   (reply)`,
+    `${p}crysnova lastroast  (reply)`,
     `${p}crysnova roastlevel <soft|medium|savage>`,
     "",
     "UTILS",
@@ -476,7 +566,6 @@ function setRoastLevel(m, lvl) {
   setPrefs(m, { roastlevel: lvl });
   return lvl;
 }
-
 async function doRoast(m, targetLabel) {
   const lvl = roastLevelOf(m);
   const instruction =
@@ -493,23 +582,100 @@ async function doRoast(m, targetLabel) {
 }
 
 /* [PART 2 END] */
-/* [CRYSNOVA AI v2 — PART 3 / 3] */
+/* ----------------- SCHEDULER ENGINE ----------------- */
+let schedJobsStarted = false;
+
+function parseHHMM(s) {
+  const m = String(s || "").trim().match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+  if (!m) return null;
+  return { hh: Number(m[1]), mm: Number(m[2]) };
+}
+
+async function broadcastToTargets(client, text) {
+  const targets = listTargets();
+  if (!targets.length) return;
+
+  for (const jid of targets) {
+    try {
+      await client.sendMessage(jid, { text });
+    } catch {}
+  }
+}
+
+function startSchedulerOnce(client) {
+  if (schedJobsStarted) return;
+  schedJobsStarted = true;
+
+  // Runs every minute; checks if sched enabled and time matches
+  cron.schedule("* * * * *", async () => {
+    try {
+      const sch = getSched();
+      if (!sch.enabled) return;
+
+      const onT = parseHHMM(sch.onTime);
+      const offT = parseHHMM(sch.offTime);
+      if (!onT || !offT) return;
+
+      const now = new Date();
+      const hh = now.getHours();
+      const mm = now.getMinutes();
+
+      // ON
+      if (hh === onT.hh && mm === onT.mm) {
+        const targets = listTargets();
+        for (const jid of targets) {
+          try {
+            // set chat session for each target chat
+            // (fake a minimal m object for setters)
+            setChatPrefs({ chat: jid, key: { remoteJid: jid } }, { session_on: true });
+          } catch {}
+        }
+        await broadcastToTargets(client, sch.msgOn || "CRYSNOVA session enabled.");
+      }
+
+      // OFF
+      if (hh === offT.hh && mm === offT.mm) {
+        const targets = listTargets();
+        for (const jid of targets) {
+          try {
+            setChatPrefs({ chat: jid, key: { remoteJid: jid } }, { session_on: false });
+          } catch {}
+        }
+        await broadcastToTargets(client, sch.msgOff || "CRYSNOVA session disabled.");
+      }
+    } catch {
+      return;
+    }
+  }, { timezone: "Africa/Lagos" });
+}
 
 /* ----------------- MAIN COMMAND ----------------- */
 kord(
   {
     cmd: "crysnova|crys",
-    desc: "Crysnova AI (premium assistant + session auto-reply)",
+    desc: "Crysnova AI (premium assistant + session auto-reply + scheduler)",
     fromMe: wtype,
     type: "tools",
     react: "💎",
   },
   async (m, text) => {
     try {
+      // start scheduler (safe)
+      if (m?.client) startSchedulerOnce(m.client);
+
       const raw = getTextFromAny(m, text).trim();
       const args = raw.split(/\s+/).filter(Boolean);
-      const sub = (args[0] || "menu").toLowerCase();
-      const rest = args.slice(1).join(" ").trim();
+
+      // KORD cores differ: sometimes text already excludes subcommand.
+      // So we also read from full message and remove "crysnova/crys" if present.
+      let sub = (args[0] || "menu").toLowerCase();
+      let rest = args.slice(1).join(" ").trim();
+
+      if (sub === "crysnova" || sub === "crys") {
+        sub = (args[1] || "menu").toLowerCase();
+        rest = args.slice(2).join(" ").trim();
+      }
+
       const p = SAFE_PREFIX();
 
       // SESSION CONTROLS
@@ -531,20 +697,108 @@ kord(
       }
       if (sub === "status") {
         const st = sessionState(m);
-        return sendText(m, `Session: ${st.on ? "ON" : "OFF"}\nMode: ${st.mode.toUpperCase()}`);
+        const sch = getSched();
+        return sendText(
+          m,
+          `Session: ${st.on ? "ON" : "OFF"}\nMode: ${st.mode.toUpperCase()}\nScheduler: ${sch.enabled ? "ON" : "OFF"}\nTargets: ${listTargets().length}`
+        );
+      }
+
+      // TARGETS
+      if (sub === "targets") {
+        if (!isAllowed(m)) return;
+        const parts = rest.split(/\s+/).filter(Boolean);
+        const act = (parts[0] || "").toLowerCase();
+
+        if (act === "add") {
+          addTarget(getChatId(m));
+          return sendText(m, "Target added: this chat is now in scheduler/broadcast list.");
+        }
+        if (act === "del") {
+          delTarget(getChatId(m));
+          return sendText(m, "Target removed: this chat removed from scheduler/broadcast list.");
+        }
+        if (act === "clear") {
+          clearTargets();
+          return sendText(m, "Targets cleared.");
+        }
+        if (act === "list") {
+          const t = listTargets();
+          if (!t.length) return sendText(m, "No targets saved. Use: crysnova targets add (inside a group/DM)");
+          return sendText(m, "Targets:\n" + t.map((x,i)=>`${i+1}. ${x}`).join("\n"));
+        }
+        return sendText(m, `Use:\n${p}crysnova targets add|del|list|clear`);
+      }
+
+      // SCHED
+      if (sub === "sched") {
+        if (!isAllowed(m)) return;
+        const parts = rest.split(/\s+/).filter(Boolean);
+        const act = (parts[0] || "").toLowerCase();
+        const sch = getSched();
+
+        if (act === "on") {
+          setSched({ enabled: true });
+          return sendText(m, `Scheduler ON.\nON: ${getSched().onTime}\nOFF: ${getSched().offTime}`);
+        }
+        if (act === "off") {
+          setSched({ enabled: false });
+          return sendText(m, "Scheduler OFF.");
+        }
+        if (act === "status") {
+          const s = getSched();
+          return sendText(m, `Scheduler: ${s.enabled ? "ON" : "OFF"}\nON: ${s.onTime}\nOFF: ${s.offTime}\nTargets: ${listTargets().length}`);
+        }
+        if (act === "seton") {
+          const t = parts[1];
+          if (!parseHHMM(t)) return sendText(m, "Use: crysnova sched seton HH:MM  (e.g. 12:00)");
+          setSched({ onTime: t });
+          return sendText(m, `Scheduler ON time set: ${t}`);
+        }
+        if (act === "setoff") {
+          const t = parts[1];
+          if (!parseHHMM(t)) return sendText(m, "Use: crysnova sched setoff HH:MM  (e.g. 05:00)");
+          setSched({ offTime: t });
+          return sendText(m, `Scheduler OFF time set: ${t}`);
+        }
+        if (act === "msgon") {
+          const msg = parts.slice(1).join(" ").trim();
+          if (!msg) return sendText(m, "Use: crysnova sched msgon <text>");
+          setSched({ msgOn: msg });
+          return sendText(m, "Scheduler ON message updated.");
+        }
+        if (act === "msgoff") {
+          const msg = parts.slice(1).join(" ").trim();
+          if (!msg) return sendText(m, "Use: crysnova sched msgoff <text>");
+          setSched({ msgOff: msg });
+          return sendText(m, "Scheduler OFF message updated.");
+        }
+
+        return sendText(
+          m,
+          `Scheduler commands:\n` +
+          `${p}crysnova sched on|off|status\n` +
+          `${p}crysnova sched seton HH:MM\n` +
+          `${p}crysnova sched setoff HH:MM\n` +
+          `${p}crysnova sched msgon <text>\n` +
+          `${p}crysnova sched msgoff <text>`
+        );
       }
 
       if (sub === "menu" || sub === "help") return sendMenu(m);
 
       if (sub === "setup") {
         const okAI = OPENAI_API_KEY ? "✅" : "❌";
+        const okAI2 = OPENAI_API_KEY2 ? "✅" : "❌";
         const okW = (process.env.OPENWEATHER_API_KEY || "").trim() ? "✅" : "❌";
         return sendText(
           m,
           `SETUP\n` +
           `AI Key: ${okAI}\n` +
-          `Weather Key: ${okW}\n` +
+          `AI Key2: ${okAI2}\n` +
           `Model: ${MODEL}\n` +
+          `Fallback: ${FALLBACK_MODEL}\n` +
+          `Weather Key: ${okW}\n` +
           `Memory: ${memCap()} turns\n` +
           `Cooldown: ${cdSec()}s\n` +
           `Theme: ${(process.env.CRYS_THEME || "neon")}`
@@ -640,55 +894,50 @@ kord(
 );
 
 /* ----------------- AUTO-REPLY LISTENER -----------------
-   When Session is ON:
-   - Mode TAG: only reply when you/bot are mentioned
-   - Mode ALL: reply to everyone
-   Skips commands (prefix) to avoid replying to bot commands.
+   Session ON:
+   - TAG mode: reply only when bot/owner is tagged
+   - ALL mode: reply to everyone
+   Skips commands to avoid replying to bot commands.
 -------------------------------------------------------- */
 kord({ on: "all" }, async (m, textArg) => {
   try {
-    // Must exist
     if (!m) return;
+    if (m?.fromMe) return; // prevent loops
 
-    // Ignore own outgoing messages to avoid loops
-    if (m?.fromMe) return;
+    // start scheduler
+    if (m?.client) startSchedulerOnce(m.client);
 
     const st = sessionState(m);
     if (!st.on) return;
 
-    // Only reply in groups/DMs where session enabled (per chat saved)
-    // If TAG mode: require mention
+    // TAG mode requires mention
     if (st.mode === "tag" && !isTaggedForSession(m)) return;
 
     const txt = getTextFromAny(m, textArg).trim();
     if (!txt) return;
 
-    // Skip if it looks like a command (starts with prefix)
+    // ignore messages that look like commands
     const p = SAFE_PREFIX();
     if (txt.startsWith(p)) return;
 
-    // Cooldown per chat (prevent spam)
+    // cooldown per chat for auto
     const cdKey = "auto::" + getChatId(m);
     const left = checkCooldownKey(cdKey);
     if (left) return;
 
-    // Build a short prompt with context
     const name = m?.pushName ? String(m.pushName).trim() : "user";
-    const mode = "auto";
     const prompt =
       `Reply to this WhatsApp message as CRYSNOVA AI.\n` +
       `Sender name: ${name}\n` +
       `Message: ${txt}\n\n` +
       `Reply short, helpful, and natural.`;
 
-    const out = await aiReply(m, prompt, mode);
+    const out = await aiReply(m, prompt, "auto");
     return sendText(m, out);
   } catch {
-    // silent fail (don’t spam errors during auto)
     return;
   }
 });
 
 module.exports = {};
-
 /* [PART 3 END] */
