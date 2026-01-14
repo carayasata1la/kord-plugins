@@ -1,49 +1,43 @@
 /**
- * ANTI-DEMODE PRO v1.1 — Event + Watchdog Restore
- *
+ * Anti-Demote PRO (Fixed, No Looping)
  * Commands:
- *  - antidemote on
- *  - antidemote off
- *  - antidemote status
+ *  - antidemote on | off
+ *  - antidemote mode all | selected
  *  - antidemote protectme
- *  - antidemote add @user
- *  - antidemote remove @user
+ *  - antidemote protect @user  (or reply a user)
+ *  - antidemote unprotect @user (or reply a user)
  *  - antidemote list
- *  - antidemote alladmins on|off
- *  - antidemote mode all|selected
+ *  - antidemote status
  *
- * IMPORTANT:
- *  - Bot MUST be admin to promote anyone.
- *  - This version works even if your core does NOT emit demote events.
+ * Notes:
+ *  - Bot MUST be admin to restore promotion.
+ *  - Loop protection included (recent-action guard).
  */
 
 const fs = require("fs");
 const path = require("path");
 const { kord, wtype, config } = require("../core");
 
-/* ---------------- SAFE CONFIG ---------------- */
+/* ----------------- SAFE CONFIG ----------------- */
 function getCfgAny() {
   try { if (typeof config === "function") return config() || {}; } catch {}
   try { return config || {}; } catch { return {}; }
 }
-function getSenderId(m) {
-  return m?.sender || m?.key?.participant || m?.participant || m?.key?.remoteJid || "unknown";
-}
+
 function getChatId(m) {
   return m?.key?.remoteJid || m?.chat || "unknown";
 }
-function getText(m, textArg) {
-  return String(
-    (typeof textArg === "string" ? textArg : "") ||
-    m?.message?.conversation ||
-    m?.message?.extendedTextMessage?.text ||
-    m?.text ||
-    m?.body ||
-    ""
-  ).trim();
+
+function getSenderId(m) {
+  return m?.sender || m?.key?.participant || m?.participant || "unknown";
 }
+
 function isAllowed(m) {
-  if (m?.fromMe || m?.isOwner || m?.isSudo || m?.isMod) return true;
+  if (m?.fromMe) return true;
+  if (m?.isOwner) return true;
+  if (m?.isSudo) return true;
+  if (m?.isMod) return true;
+
   const cfg = getCfgAny();
   const sudoRaw = cfg?.SUDO || cfg?.SUDO_USERS || cfg?.SUDOS;
   const sender = getSenderId(m);
@@ -56,294 +50,296 @@ function isAllowed(m) {
   return false;
 }
 
-/* ---------------- STORAGE ---------------- */
+function ownerJidGuess(m) {
+  // Prefer core-provided owner number
+  const cfg = getCfgAny();
+  const raw =
+    cfg?.OWNER_NUMBER ||
+    cfg?.OWNER ||
+    cfg?.OWNERNUM ||
+    process.env.OWNER_NUMBER ||
+    process.env.OWNER ||
+    "";
+  const digits = String(raw).replace(/\D/g, "");
+  if (digits) return `${digits}@s.whatsapp.net`;
+
+  // fallback: if m.isOwner is true, assume sender is owner
+  if (m?.isOwner && m?.sender) return m.sender;
+
+  return "";
+}
+
+async function sendText(m, text) {
+  try { if (typeof m.reply === "function") return await m.reply(text); } catch {}
+  try { if (typeof m.send === "function") return await m.send(text); } catch {}
+  try {
+    if (m?.client?.sendMessage) {
+      return await m.client.sendMessage(getChatId(m), { text }, { quoted: m });
+    }
+  } catch {}
+}
+
+/* ----------------- STORAGE ----------------- */
 const DATA_DIR = path.join(process.cwd(), "data");
-const STORE_FILE = path.join(DATA_DIR, "antidemote.json");
+const DB_FILE = path.join(DATA_DIR, "antidemote_pro.json");
 
 function ensureStore() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(STORE_FILE)) fs.writeFileSync(STORE_FILE, JSON.stringify({ chats: {} }, null, 2), "utf8");
+  try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+  try {
+    if (!fs.existsSync(DB_FILE)) {
+      fs.writeFileSync(DB_FILE, JSON.stringify({ groups: {} }, null, 2), "utf8");
+    }
+  } catch {}
 }
-function readStore() {
-  ensureStore();
-  try { return JSON.parse(fs.readFileSync(STORE_FILE, "utf8")); } catch { return { chats: {} }; }
-}
-function writeStore(db) {
-  ensureStore();
-  fs.writeFileSync(STORE_FILE, JSON.stringify(db, null, 2), "utf8");
-}
-function chatKeyFromJid(jid) {
-  return String(jid || "");
-}
-function getChatStateByJid(jid) {
-  const db = readStore();
-  const k = chatKeyFromJid(jid);
-  return db.chats[k] || { enabled: false, mode: "selected", allAdmins: false, protected: [], lastAction: null };
-}
-function setChatStateByJid(jid, patch) {
-  const db = readStore();
-  const k = chatKeyFromJid(jid);
-  const prev = db.chats[k] || { enabled: false, mode: "selected", allAdmins: false, protected: [], lastAction: null };
-  db.chats[k] = { ...prev, ...patch, lastAction: Date.now() };
-  writeStore(db);
-  return db.chats[k];
-}
-function chatKey(m) { return getChatId(m); }
-function getChatState(m) { return getChatStateByJid(chatKey(m)); }
-function setChatState(m, patch) { return setChatStateByJid(chatKey(m), patch); }
 
-function normalizeJid(j) {
+function readDB() {
+  ensureStore();
+  try { return JSON.parse(fs.readFileSync(DB_FILE, "utf8") || "{}"); } catch { return { groups: {} }; }
+}
+
+function writeDB(db) {
+  ensureStore();
+  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf8");
+}
+
+function getGroupState(gid) {
+  const db = readDB();
+  if (!db.groups) db.groups = {};
+  if (!db.groups[gid]) {
+    db.groups[gid] = {
+      enabled: false,
+      mode: "selected", // selected | all
+      protected: []     // list of jids
+    };
+    writeDB(db);
+  }
+  return db.groups[gid];
+}
+
+function setGroupState(gid, patch) {
+  const db = readDB();
+  if (!db.groups) db.groups = {};
+  db.groups[gid] = { ...(db.groups[gid] || { enabled:false, mode:"selected", protected:[] }), ...patch };
+  writeDB(db);
+  return db.groups[gid];
+}
+
+function normJid(j) {
   if (!j) return "";
   const s = String(j);
   if (s.includes("@")) return s;
-  const digits = s.replace(/\D/g, "");
-  return digits ? `${digits}@s.whatsapp.net` : s;
+  return `${s.replace(/\D/g, "")}@s.whatsapp.net`;
 }
+
 function uniq(arr) {
-  return Array.from(new Set((arr || []).map(normalizeJid).filter(Boolean)));
+  return Array.from(new Set((arr || []).filter(Boolean)));
 }
 
-/* ---------------- BOT/OWNER ---------------- */
-function getBotJid(m) {
-  const a = m?.client?.user?.id || m?.client?.user?.jid || "";
-  if (!a) return "";
-  return String(a).includes("@") ? String(a) : `${String(a)}@s.whatsapp.net`;
-}
-function getOwnerJidGuess() {
-  const cfg = getCfgAny();
-  const n = cfg?.OWNER_NUMBER || cfg?.OWNER || cfg?.OWNERNUM || "";
-  const digits = String(n || "").replace(/\D/g, "");
-  return digits ? `${digits}@s.whatsapp.net` : "";
+/* ----------------- LOOP / SPAM GUARDS ----------------- */
+// When bot promotes someone, WhatsApp fires group-participants.update again.
+// We skip handling if we recently acted on that target.
+const RECENT = new Map(); // key = `${gid}::${jid}`, val = timestamp
+const RECENT_WINDOW_MS = 12 * 1000;
+
+function markRecent(gid, jid) {
+  RECENT.set(`${gid}::${jid}`, Date.now());
 }
 
-/* ---------------- GROUP OPS ---------------- */
-async function isBotAdmin(client, groupJid, botJid) {
+function isRecent(gid, jid) {
+  const t = RECENT.get(`${gid}::${jid}`) || 0;
+  return Date.now() - t < RECENT_WINDOW_MS;
+}
+
+/* ----------------- BIND LISTENER ONCE ----------------- */
+global.__ANTIDEMOTE_PRO_BOUND__ = global.__ANTIDEMOTE_PRO_BOUND__ || false;
+async function botIsAdmin(client, gid) {
   try {
-    const meta = await client.groupMetadata(groupJid);
-    const me = (meta?.participants || []).find(p => p.id === botJid);
-    return !!(me && (me.admin === "admin" || me.admin === "superadmin"));
-  } catch { return false; }
+    const meta = await client.groupMetadata(gid);
+    const me = client.user?.id || client.user?.jid || "";
+    const myJid = me.includes("@") ? me : `${String(me).replace(/\D/g,"")}@s.whatsapp.net`;
+    const p = (meta.participants || []).find(x => x.id === myJid);
+    return !!(p && (p.admin === "admin" || p.admin === "superadmin"));
+  } catch {
+    return false;
+  }
 }
 
-async function getAdmins(client, groupJid) {
+function shouldProtect(state, targetJid) {
+  if (!state?.enabled) return false;
+  if (state.mode === "all") return true;
+  const list = (state.protected || []).map(normJid);
+  return list.includes(normJid(targetJid));
+}
+
+async function restoreAdmin(client, gid, jid) {
+  // Baileys: groupParticipantsUpdate(gid, [jid], "promote")
+  await client.groupParticipantsUpdate(gid, [jid], "promote");
+  markRecent(gid, jid);
+}
+
+/**
+ * EVENT HANDLER
+ * Fires when someone is promoted/demoted/added/removed.
+ */
+async function onGroupUpdate(client, update) {
   try {
-    const meta = await client.groupMetadata(groupJid);
-    return (meta?.participants || [])
-      .filter(p => p.admin === "admin" || p.admin === "superadmin")
-      .map(p => p.id);
-  } catch { return []; }
+    const gid = update?.id;
+    const participants = update?.participants || [];
+    const action = String(update?.action || "").toLowerCase(); // promote|demote|add|remove
+
+    if (!gid || !participants.length) return;
+    if (action !== "demote") return; // only care demote
+
+    const state = getGroupState(gid);
+    if (!state.enabled) return;
+
+    // Bot must be admin
+    const okAdmin = await botIsAdmin(client, gid);
+    if (!okAdmin) return;
+
+    for (const jid of participants) {
+      const target = normJid(jid);
+
+      // prevent looping (ignore if we just promoted them)
+      if (isRecent(gid, target)) continue;
+
+      // Decide if protected
+      if (!shouldProtect(state, target)) continue;
+
+      // Restore
+      await restoreAdmin(client, gid, target);
+    }
+  } catch {
+    // silent (don’t spam)
+  }
 }
 
-async function promote(client, groupJid, jid) {
-  return client.groupParticipantsUpdate(groupJid, [jid], "promote");
+/* Bind listener only once */
+function bindOnce(client) {
+  if (!client?.ev?.on) return false;
+  if (global.__ANTIDEMOTE_PRO_BOUND__) return true;
+
+  client.ev.on("group-participants.update", (u) => onGroupUpdate(client, u));
+  global.__ANTIDEMOTE_PRO_BOUND__ = true;
+  return true;
 }
 
-/* ---------------- UI ---------------- */
-function statusCard(st) {
+/* Helper: get target jid from mention or reply */
+function getTargetJid(m) {
+  if (Array.isArray(m?.mentionedJid) && m.mentionedJid.length) return normJid(m.mentionedJid[0]);
+  if (m?.quoted?.sender) return normJid(m.quoted.sender);
+  return "";
+}
+
+function statusText(gid) {
+  const st = getGroupState(gid);
   return (
-    "🛡️ ANTI-DEMODE PRO\n" +
-    "━━━━━━━━━━━━━━━━━━\n" +
+    `🛡️ ANTI-DEMOTE PRO\n` +
     `Enabled: ${st.enabled ? "YES" : "NO"}\n` +
-    `Mode: ${(st.mode || "selected").toUpperCase()}\n` +
-    `All Admins: ${st.allAdmins ? "ON" : "OFF"}\n` +
-    `Protected: ${(st.protected || []).length}\n` +
-    "━━━━━━━━━━━━━━━━━━\n" +
-    "Tip:\n" +
-    "• Bot must be admin to restore demotion\n" +
-    "• v1.1 includes Watchdog restore"
+    `Mode: ${String(st.mode || "selected").toUpperCase()}\n` +
+    `Protected: ${(st.protected || []).length}`
   );
 }
-
-/* ---------------- CLIENT CACHE (for watchdog) ---------------- */
-const LAST_CLIENT = new Map(); // groupJid -> client
-function saveClientRef(m) {
-  const jid = getChatId(m);
-  if (jid && m?.client) LAST_CLIENT.set(jid, m.client);
-}
-
-/* ---------------- COMMANDS ---------------- */
 kord(
-  { cmd: "antidemote|antid", desc: "Premium Anti-Demote protection", fromMe: wtype, type: "tools", react: "🛡️" },
-  async (m, arg) => {
+  {
+    cmd: "antidemote|adp",
+    desc: "Anti-Demote PRO (fixed)",
+    fromMe: wtype,
+    type: "tools",
+    react: "🛡️",
+  },
+  async (m, text) => {
     try {
-      saveClientRef(m);
+      const gid = getChatId(m);
+      const raw = String(text || "").trim();
+      const args = raw.split(/\s+/).filter(Boolean);
+      const sub = (args[0] || "status").toLowerCase();
+      const state = getGroupState(gid);
 
-      const text = getText(m, arg);
-      const parts = text.split(/\s+/).filter(Boolean);
-      const sub = (parts[0] || "status").toLowerCase();
+      // Bind listener the first time any command runs (important)
+      bindOnce(m?.client);
 
-      const groupJid = getChatId(m);
-      const isGroup = String(groupJid).endsWith("@g.us");
+      // STATUS always allowed
+      if (sub === "status") return sendText(m, statusText(gid));
 
-      if (!isGroup && sub !== "status") return m.reply("❌ Anti-demote works only in groups.");
+      // Admin controls must be allowed
+      if (!isAllowed(m)) return;
 
-      const st0 = getChatState(m);
+      if (sub === "on" || sub === "enable") {
+        // auto-protect owner first
+        const owner = ownerJidGuess(m);
+        let list = state.protected || [];
+        if (owner) list = uniq([...list, owner]);
 
-      if (["on","off","add","remove","protectme","mode","alladmins"].includes(sub) && !isAllowed(m)) return;
-
-      if (sub === "status") return m.reply(statusCard(st0));
-
-      if (sub === "on") {
-        const owner = normalizeJid(getOwnerJidGuess() || getSenderId(m));
-        const st = setChatState(m, { enabled: true, protected: uniq([...(st0.protected||[]), owner]) });
-        return m.reply("✅ Anti-demote enabled.\n\n" + statusCard(st));
+        setGroupState(gid, { enabled: true, mode: state.mode || "selected", protected: list });
+        return sendText(
+          m,
+          `${statusText(gid)}\n\n✅ Enabled.\n👑 Owner auto-protected.`
+        );
       }
 
-      if (sub === "off") {
-        const st = setChatState(m, { enabled: false });
-        return m.reply("🛑 Anti-demote disabled.\n\n" + statusCard(st));
-      }
-
-      if (sub === "protectme") {
-        const me = normalizeJid(getSenderId(m));
-        const st = setChatState(m, { protected: uniq([...(st0.protected||[]), me]) });
-        return m.reply("✅ You are now protected.\n\n" + statusCard(st));
+      if (sub === "off" || sub === "disable") {
+        setGroupState(gid, { enabled: false });
+        return sendText(m, `${statusText(gid)}\n\n🛑 Disabled.`);
       }
 
       if (sub === "mode") {
-        const md = (parts[1] || "").toLowerCase();
-        if (!["all","selected"].includes(md)) return m.reply("❌ Use: antidemote mode all | selected");
-        const st = setChatState(m, { mode: md });
-        return m.reply(`✅ Mode set: ${md.toUpperCase()}\n\n${statusCard(st)}`);
+        const md = String(args[1] || "").toLowerCase();
+        if (!["all", "selected"].includes(md)) {
+          return sendText(m, "Use: antidemote mode all  OR  antidemote mode selected");
+        }
+        setGroupState(gid, { mode: md });
+        return sendText(m, `${statusText(gid)}\n\n✅ Mode set: ${md.toUpperCase()}`);
       }
 
-      if (sub === "alladmins") {
-        const v = (parts[1] || "").toLowerCase();
-        if (!["on","off"].includes(v)) return m.reply("❌ Use: antidemote alladmins on | off");
-        const st = setChatState(m, { allAdmins: v === "on" });
-        return m.reply(`✅ All Admins: ${v.toUpperCase()}\n\n${statusCard(st)}`);
+      if (sub === "protectme") {
+        const me = ownerJidGuess(m) || normJid(getSenderId(m));
+        const list = uniq([...(state.protected || []), me]);
+        setGroupState(gid, { protected: list });
+        return sendText(m, `${statusText(gid)}\n\n✅ Added you to protected.`);
       }
 
-      if (sub === "add") {
-        const mention = m?.mentionedJid?.[0];
-        if (!mention) return m.reply("❌ Tag a user: antidemote add @user");
-        const st = setChatState(m, { protected: uniq([...(st0.protected||[]), mention]) });
-        return m.reply(`✅ Added: @${mention.split("@")[0]}`, { mentions: [mention] });
+      if (sub === "protect") {
+        const target = getTargetJid(m);
+        if (!target) return sendText(m, "Tag a user or reply to them: antidemote protect @user");
+        const list = uniq([...(state.protected || []), target]);
+        setGroupState(gid, { protected: list });
+        return sendText(m, `${statusText(gid)}\n\n✅ Protected: @${target.split("@")[0]}`);
       }
 
-      if (sub === "remove") {
-        const mention = m?.mentionedJid?.[0];
-        if (!mention) return m.reply("❌ Tag a user: antidemote remove @user");
-        const st = setChatState(m, { protected: (st0.protected||[]).filter(x => normalizeJid(x) !== normalizeJid(mention)) });
-        return m.reply(`✅ Removed: @${mention.split("@")[0]}`, { mentions: [mention] });
+      if (sub === "unprotect") {
+        const target = getTargetJid(m);
+        if (!target) return sendText(m, "Tag a user or reply to them: antidemote unprotect @user");
+        const list = (state.protected || []).map(normJid).filter(x => x !== normJid(target));
+        setGroupState(gid, { protected: list });
+        return sendText(m, `${statusText(gid)}\n\n✅ Removed: @${target.split("@")[0]}`);
       }
 
       if (sub === "list") {
-        const list = uniq(st0.protected || []);
-        if (!list.length) return m.reply("Protected list is empty.");
-        const lines = list.map(j => `• @${String(j).split("@")[0]}`);
-        return m.reply("🧾 Protected Users:\n" + lines.join("\n"), { mentions: list });
+        const list = (state.protected || []).map(normJid);
+        if (!list.length) return sendText(m, `${statusText(gid)}\n\n(no protected users)`);
+        const out = list.map((j, i) => `${i + 1}. @${j.split("@")[0]}`).join("\n");
+        // mentions
+        return m?.client?.sendMessage
+          ? m.client.sendMessage(gid, { text: `🛡️ Protected List\n\n${out}`, mentions: list }, { quoted: m })
+          : sendText(m, `🛡️ Protected List\n\n${out}`);
       }
 
-      return m.reply("❌ Unknown.\nUse: antidemote on|off|status|protectme|add|remove|list|mode|alladmins");
+      return sendText(
+        m,
+        "Commands:\n" +
+        "• antidemote on | off\n" +
+        "• antidemote mode all | selected\n" +
+        "• antidemote protectme\n" +
+        "• antidemote protect @user (or reply)\n" +
+        "• antidemote unprotect @user (or reply)\n" +
+        "• antidemote list\n" +
+        "• antidemote status"
+      );
     } catch (e) {
-      return m.reply("❌ Anti-demote error: " + (e?.message || e));
+      return sendText(m, "❌ Anti-Demote error: " + (e?.message || e));
     }
   }
 );
-
-/* ---------------- EVENT LISTENER (best-effort) ----------------
-   If your core emits demote events, this will act instantly.
---------------------------------------------------------------- */
-kord({ on: "group-participants.update" }, async (m, update) => {
-  try {
-    if (!m?.client || !update) return;
-    const groupJid = update.id || update.jid || update.chat;
-    if (!groupJid || !String(groupJid).endsWith("@g.us")) return;
-
-    saveClientRef({ ...m, key: { remoteJid: groupJid }, chat: groupJid, client: m.client });
-
-    const st = getChatStateByJid(groupJid);
-    if (!st.enabled) return;
-
-    const action = String(update.action || "").toLowerCase();
-    if (action !== "demote") return;
-
-    const botJid = getBotJid(m);
-    if (!botJid) return;
-
-    const ok = await isBotAdmin(m.client, groupJid, botJid);
-    if (!ok) return;
-
-    let protectedSet = new Set(uniq(st.protected || []));
-    if (st.allAdmins || String(st.mode).toLowerCase() === "all") {
-      const admins = await getAdmins(m.client, groupJid);
-      admins.forEach(a => protectedSet.add(normalizeJid(a)));
-    }
-
-    const targets = Array.isArray(update.participants) ? update.participants : [];
-    for (const t of targets) {
-      const jid = normalizeJid(t);
-      if (!protectedSet.has(jid)) continue;
-      try { await promote(m.client, groupJid, jid); } catch {}
-    }
-  } catch {}
-});
-
-/* ---------------- WATCHDOG (works even if events fail) ----------------
-   Every 7 seconds:
-   - For each enabled chat, checks protected users
-   - If protected user is NOT admin anymore -> re-promote
------------------------------------------------------------------------ */
-const WATCH_EVERY_MS = 7000;
-let WATCH_RUNNING = false;
-
-async function watchdogTick() {
-  if (WATCH_RUNNING) return;
-  WATCH_RUNNING = true;
-  try {
-    const db = readStore();
-    const chats = db?.chats || {};
-
-    for (const groupJid of Object.keys(chats)) {
-      try {
-        if (!String(groupJid).endsWith("@g.us")) continue;
-
-        const st = chats[groupJid];
-        if (!st?.enabled) continue;
-
-        const client = LAST_CLIENT.get(groupJid);
-        if (!client) continue; // no client ref yet (run a command in that group once)
-
-        const meta = await client.groupMetadata(groupJid);
-        const botJid = (client?.user?.id || client?.user?.jid || "");
-        const botFull = botJid ? (String(botJid).includes("@") ? String(botJid) : `${botJid}@s.whatsapp.net`) : "";
-        if (!botFull) continue;
-
-        const me = (meta?.participants || []).find(p => p.id === botFull);
-        const botIsAdmin = !!(me && (me.admin === "admin" || me.admin === "superadmin"));
-        if (!botIsAdmin) continue;
-
-        const adminsNow = (meta?.participants || [])
-          .filter(p => p.admin === "admin" || p.admin === "superadmin")
-          .map(p => normalizeJid(p.id));
-
-        let protectedSet = new Set(uniq(st.protected || []));
-        if (st.allAdmins || String(st.mode).toLowerCase() === "all") {
-          adminsNow.forEach(a => protectedSet.add(a));
-        }
-
-        for (const jid of protectedSet) {
-          // must be present in group participants
-          const p = (meta?.participants || []).find(x => normalizeJid(x.id) === normalizeJid(jid));
-          if (!p) continue;
-
-          const isAdminNow = (p.admin === "admin" || p.admin === "superadmin");
-          if (!isAdminNow) {
-            try { await promote(client, groupJid, normalizeJid(jid)); } catch {}
-          }
-        }
-      } catch {
-        // ignore single chat failure
-      }
-    }
-  } catch {
-    // ignore
-  } finally {
-    WATCH_RUNNING = false;
-  }
-}
-
-setInterval(watchdogTick, WATCH_EVERY_MS);
 
 module.exports = {};
